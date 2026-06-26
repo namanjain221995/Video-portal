@@ -1,0 +1,73 @@
+name: Deploy to EC2
+
+# Runs on every push to main, or manually from the Actions tab.
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  # ── 1. Fail fast if the code is broken, before touching the server ──────────
+  check:
+    name: Sanity check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile + import
+        run: |
+          python -m py_compile app.py auth.py s3_service.py
+          DEMO_MODE=true SECRET_KEY=ci python -c "import app; print('import OK')"
+
+  # ── 2. Deploy: pull latest on the box and rebuild the container ─────────────
+  deploy:
+    name: Deploy to EC2
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      # Optional: if you store the whole .env as a GitHub secret named ENV_FILE,
+      # this writes it to the server each deploy. If you don't set ENV_FILE,
+      # this step is skipped and the .env you created on the box is used as-is.
+      - name: Sync .env from secret (optional)
+        if: ${{ secrets.ENV_FILE != '' }}
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          envs: ENV_FILE
+          script: |
+            mkdir -p ~/Video-portal
+            printf '%s' "$ENV_FILE" > ~/Video-portal/.env
+            chmod 600 ~/Video-portal/.env
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+
+      - name: Pull + rebuild
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          port: ${{ secrets.EC2_PORT || 22 }}
+          script: |
+            set -e
+            REPO_DIR=~/Video-portal
+            if [ ! -d "$REPO_DIR/.git" ]; then
+              git clone https://github.com/namanjain221995/Video-portal.git "$REPO_DIR"
+            fi
+            cd "$REPO_DIR"
+            git fetch --all --quiet
+            git reset --hard origin/main          # .env & docker volumes are untouched (gitignored / external)
+            if [ ! -f .env ]; then
+              echo "ERROR: .env is missing on the server. Create it once (see DEPLOY.md) or set the ENV_FILE secret."
+              exit 1
+            fi
+            docker compose up -d --build
+            docker image prune -f
+            docker compose ps
