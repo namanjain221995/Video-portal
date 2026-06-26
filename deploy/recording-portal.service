@@ -1,0 +1,27 @@
+# Save as /etc/systemd/system/recording-portal.service
+# Then:
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now recording-portal
+#   sudo systemctl status recording-portal
+#   journalctl -u recording-portal -f      # live logs
+
+[Unit]
+Description=Interview-Success Recording Portal
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/zoom-interview-portal
+EnvironmentFile=/home/ubuntu/zoom-interview-portal/.env
+ExecStart=/home/ubuntu/zoom-interview-portal/venv/bin/gunicorn \
+    --workers 3 \
+    --threads 4 \
+    --timeout 600 \
+    --bind 0.0.0.0:8000 \
+    app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

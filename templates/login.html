@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Recording Portal{% endblock %}
+
+{% block body %}
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="login-logo">🎥</div>
+    <h1>Recording Portal</h1>
+    <p class="sub">Search &amp; download interview recordings</p>
+
+    <div id="error" class="notice notice-error"></div>
+
+    <form id="login-form" autocomplete="on">
+      <div class="field">
+        <label for="username">Username</label>
+        <input class="input" id="username" name="username" type="text"
+               autocomplete="username" autofocus required>
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input class="input" id="password" name="password" type="password"
+               autocomplete="current-password" required>
+      </div>
+      <button class="btn btn-primary btn-block" id="submit" type="submit">Sign in</button>
+    </form>
+
+    <p class="login-hint">
+      Admin accounts come from <code>.env</code>.<br>
+      Normal users are created by an admin from the Admin page.
+    </p>
+  </div>
+</div>
+
+<script src="{{ asset('login.js') }}"></script>
+{% endblock %}

@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Admin · Recording Portal{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="mark">🎥</span> Recording Portal</div>
+    <span class="badge badge-admin">ADMIN</span>
+    <div class="spacer"></div>
+    <span class="who">Signed in as <strong>{{ username }}</strong></span>
+    <a class="navlink" href="{{ url_for('search_page') }}">Search</a>
+    <a class="navlink" href="{{ url_for('logout') }}">Log out</a>
+  </div>
+</header>
+
+<main class="container">
+  <div class="page-head">
+    <div>
+      <h1>User management</h1>
+      <p>Create normal users (search &amp; download only). Admins are configured in <code>.env</code>.</p>
+    </div>
+  </div>
+
+  <div id="notice" class="notice"></div>
+
+  <div class="grid-2">
+    <!-- Users list -->
+    <section class="card card-pad">
+      <h2>Users</h2>
+      <p class="card-sub">Created by admins. Stored hashed in <code>users.json</code>.</p>
+      <div id="users-table">
+        <div class="empty"><div class="big">⏳</div>Loading…</div>
+      </div>
+
+      <h2 style="margin-top:26px;">Admins</h2>
+      <p class="card-sub">Defined in <code>.env</code> — edit there to change.</p>
+      <div id="admins-list"></div>
+    </section>
+
+    <!-- Create user -->
+    <section class="card card-pad">
+      <h2>Add a user</h2>
+      <p class="card-sub">They can sign in and search/download immediately.</p>
+      <form id="create-form">
+        <div class="field">
+          <label for="new-username">Username</label>
+          <input class="input" id="new-username" type="text" placeholder="no spaces" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label for="new-password">Password</label>
+          <input class="input" id="new-password" type="text" placeholder="give them a password" autocomplete="off" required>
+        </div>
+        <button class="btn btn-primary btn-block" id="btn-create" type="submit">Create user</button>
+      </form>
+    </section>
+  </div>
+</main>
+
+<script src="{{ asset('admin.js') }}"></script>
+{% endblock %}

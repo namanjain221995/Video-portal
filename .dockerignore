@@ -1,0 +1,16 @@
+.env
+users.json
+users.json.tmp
+venv/
+.venv/
+.verify_venv/
+__pycache__/
+*.pyc
+*.zip
+*.log
+.git/
+.gitignore
+.DS_Store
+README.md
+DOCKER.md
+deploy/

@@ -1,0 +1,39 @@
+# Run the whole portal in one command:
+#     docker compose up -d --build
+#
+# Stop:        docker compose down
+# Logs:        docker compose logs -f
+# Rebuild:     docker compose up -d --build
+#
+# Edit .env first (cp .env.example .env). For 2-4 users the defaults are fine.
+
+services:
+  portal:
+    build: .
+    image: recording-portal:latest
+    container_name: recording-portal
+    restart: unless-stopped
+
+    # Loads SECRET_KEY, ADMIN_USERS, S3_BUCKET_NAME, AWS_REGION, DEMO_MODE, etc.
+    env_file:
+      - .env
+
+    # Keep created users on a persistent volume (survives rebuilds/restarts).
+    environment:
+      USERS_FILE: /data/users.json
+      # Shared parsed S3 index on the persistent volume: workers load it instead
+      # of each re-listing the bucket, and it survives restarts.
+      INDEX_FILE: /data/index.json
+
+    # Change left side to 80 if you want http://<ec2-ip>/ instead of :8000
+    ports:
+      - "8000:8000"
+
+    volumes:
+      - portal-data:/data
+      # For LOCAL testing against the REAL bucket (DEMO_MODE=false), you can
+      # share your AWS CLI creds instead of using an EC2 role — uncomment:
+      # - ~/.aws:/root/.aws:ro
+
+volumes:
+  portal-data:

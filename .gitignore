@@ -1,0 +1,9 @@
+.env
+users.json
+__pycache__/
+*.pyc
+*.zip
+venv/
+.venv/
+.DS_Store
+*.log

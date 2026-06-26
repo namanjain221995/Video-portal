@@ -1,0 +1,97 @@
+{% extends "base.html" %}
+{% block title %}Search · Recording Portal{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="mark">🎥</span> Recording Portal</div>
+    {% if demo %}<span class="badge badge-demo">DEMO DATA</span>{% endif %}
+    <div class="spacer"></div>
+    <span class="who">Signed in as <strong>{{ username }}</strong>{% if is_admin %} · admin{% endif %}</span>
+    {% if is_admin %}<a class="navlink" href="{{ url_for('admin_page') }}">Admin</a>{% endif %}
+    <a class="navlink" href="{{ url_for('logout') }}">Log out</a>
+  </div>
+</header>
+
+<main class="container">
+  <div class="page-head">
+    <div>
+      <h1>Search recordings</h1>
+      <p>Find candidate interview recordings and download them individually or as a zip.</p>
+    </div>
+  </div>
+
+  <div id="notice" class="notice"></div>
+
+  <!-- Filters -->
+  <section class="card card-pad">
+    <form id="search-form">
+      <div class="filters">
+        <div class="field">
+          <label for="f-candidate">Candidate</label>
+          <input class="input" id="f-candidate" type="text" placeholder="e.g. sirikonda" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-company">Company</label>
+          <input class="input" id="f-company" type="text" placeholder="type a company, e.g. Gartner" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-host">Host</label>
+          <select class="input" id="f-host"><option value="">All hosts</option></select>
+        </div>
+        <div class="field">
+          <label for="f-date">Date</label>
+          <input class="input" id="f-date" type="text" placeholder="2026-06-10 or 2026-06" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-meeting">Meeting ID</label>
+          <input class="input" id="f-meeting" type="text" placeholder="e.g. 96355112813" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-filetype">File type</label>
+          <select class="input" id="f-filetype">
+            <option value="">All types</option>
+            <option value="video">Video (.mp4)</option>
+            <option value="audio">Audio (.m4a)</option>
+            <option value="transcript">Transcript (.vtt)</option>
+            <option value="chat">Chat (.txt)</option>
+            <option value="questions">Questions (.html)</option>
+            <option value="summary">AI summary (.txt)</option>
+            <option value="notes">Notes (.txt)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="filters-actions">
+        <button class="btn btn-primary" id="btn-search" type="submit">Search</button>
+        <button class="btn btn-ghost" id="btn-clear" type="button">Clear</button>
+        <div class="spacer"></div>
+        <span class="cache-info" id="cache-info"></span>
+        <button class="btn btn-ghost btn-sm" id="btn-refresh" type="button" title="Re-list the bucket now">↻ Refresh index</button>
+      </div>
+    </form>
+  </section>
+
+  <!-- Results -->
+  <div class="results-head">
+    <h2>Results</h2>
+    <div class="spacer"></div>
+    <span class="summary" id="summary"></span>
+  </div>
+
+  <div id="results-area">
+    <div class="empty"><div class="big">🔍</div>Run a search to see recordings.</div>
+  </div>
+
+  <!-- Bulk action bar -->
+  <div class="sticky-bar" id="bulk-bar" style="display:none;">
+    <span class="count" id="bulk-count">0 selected</span>
+    <span class="summary" id="bulk-size"></span>
+    <div class="spacer"></div>
+    <button class="btn btn-ghost btn-sm" id="btn-deselect" type="button">Clear selection</button>
+    <button class="btn btn-primary" id="btn-zip" type="button">⬇ Download selected (.zip)</button>
+  </div>
+</main>
+
+<script src="{{ asset('search.js') }}"></script>
+{% endblock %}
