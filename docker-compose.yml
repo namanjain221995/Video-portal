@@ -27,7 +27,7 @@ services:
 
     # Change left side to 80 if you want http://<ec2-ip>/ instead of :8000
     ports:
-      - "8000:8000"
+      - "8080:8000"
 
     volumes:
       - portal-data:/data
