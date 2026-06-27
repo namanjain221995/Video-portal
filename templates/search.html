@@ -4,7 +4,7 @@
 {% block body %}
 <header class="topbar">
   <div class="topbar-inner">
-    <div class="brand"><span class="mark">🎥</span> Recording Portal</div>
+    <div class="brand"><span class="mark"><img src="{{ asset('techsara-logo.webp') }}" alt="Techsara"></span> Recording Portal</div>
     {% if demo %}<span class="badge badge-demo">DEMO DATA</span>{% endif %}
     <div class="spacer"></div>
     <span class="who">Signed in as <strong>{{ username }}</strong>{% if is_admin %} · admin{% endif %}</span>
