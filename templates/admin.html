@@ -17,7 +17,7 @@
   <div class="page-head">
     <div>
       <h1>User management</h1>
-      <p>Create normal users (search &amp; download only). Admins are configured in <code>.env</code>.</p>
+      <p>Create users and control which <strong>departments</strong> they can browse and whether they can <strong>download</strong> or only view. Admins are configured in <code>.env</code> and can see everything.</p>
     </div>
   </div>
 
@@ -40,7 +40,7 @@
     <!-- Create user -->
     <section class="card card-pad">
       <h2>Add a user</h2>
-      <p class="card-sub">They can sign in and search/download immediately.</p>
+      <p class="card-sub">They can sign in and search immediately within the departments you grant.</p>
       <form id="create-form">
         <div class="field">
           <label for="new-username">Username</label>
@@ -49,6 +49,17 @@
         <div class="field">
           <label for="new-password">Password</label>
           <input class="input" id="new-password" type="text" placeholder="give them a password" autocomplete="off" required>
+        </div>
+        <div class="field">
+          <label>Departments they can see</label>
+          <div id="new-depts" class="dept-checks"><span class="user-meta">Loading…</span></div>
+        </div>
+        <div class="field">
+          <label for="new-perm">Access</label>
+          <select class="input" id="new-perm">
+            <option value="view">View only (stream in browser, no download)</option>
+            <option value="download">Can download (view + download/zip)</option>
+          </select>
         </div>
         <button class="btn btn-primary btn-block" id="btn-create" type="submit">Create user</button>
       </form>

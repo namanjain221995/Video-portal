@@ -27,6 +27,10 @@
   <section class="card card-pad">
     <form id="search-form">
       <div class="filters">
+        <div class="field" id="dept-field" style="display:none;">
+          <label for="f-dept">Department</label>
+          <select class="input" id="f-dept"><option value="">All departments</option></select>
+        </div>
         <div class="field">
           <label for="f-candidate">Candidate</label>
           <input class="input" id="f-candidate" type="text" placeholder="e.g. sirikonda" autocomplete="off">
@@ -92,6 +96,18 @@
     <button class="btn btn-primary" id="btn-zip" type="button">⬇ Download selected (.zip)</button>
   </div>
 </main>
+
+<!-- Preview modal (view-in-browser, no download) -->
+<div class="modal-backdrop" id="preview-modal" style="display:none;">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="preview-title">
+    <div class="modal-head">
+      <h3 id="preview-title">Preview</h3>
+      <div class="spacer"></div>
+      <button class="btn btn-ghost btn-sm" id="preview-close" type="button">✕ Close</button>
+    </div>
+    <div class="modal-body" id="preview-body"></div>
+  </div>
+</div>
 
 <script src="{{ asset('search.js') }}"></script>
 {% endblock %}

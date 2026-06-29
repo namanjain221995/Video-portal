@@ -157,6 +157,12 @@ index** button.
   for a handful of files; for very large multi-GB selections prefer individual
   downloads (those go browser→S3 directly and don't touch the server).
 - `users.json` is a flat file — good for a team-sized tool. Swap for a DB if
-  you outgrow it.
-- This portal only reads `Interview-Success/`. To cover Training/HR/etc.,
-  generalize `ROOT_PREFIX` and the key parser.
+  you outgrow it. Each user record carries `departments` (which top-level folders
+  they may browse) and `can_download` (download vs view-only).
+- Departments are the top-level bucket folders listed in `DEPARTMENTS` (`.env`).
+  The portal scans them all and an admin grants each user a subset on the Admin
+  page. Access is enforced server-side on every search/download/view request.
+- **View-only** users get an in-browser preview (`/api/view`, inline presigned
+  URL) and the download/zip buttons are removed. Note this is a soft control:
+  inline streaming can never be made fully un-saveable by a determined user — it
+  stops casual downloads, not a screen recorder or devtools.

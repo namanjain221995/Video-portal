@@ -25,7 +25,9 @@ services:
       # of each re-listing the bucket, and it survives restarts.
       INDEX_FILE: /data/index.json
 
-    # Change left side to 80 if you want http://<ec2-ip>/ instead of :8000
+    # host:container — the app listens on 8000 inside the container. Change the
+    # LEFT number to whatever host port is free (80 for http://<ec2-ip>/ , etc.).
+    # 8080 was taken by another process locally, so we use 8081.
     ports:
       - "8080:8000"
 

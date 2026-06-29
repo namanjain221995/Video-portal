@@ -7,6 +7,7 @@ Run locally:
     python app.py               # http://localhost:8000
 """
 #
+import io
 import os
 import functools
 
@@ -66,6 +67,36 @@ def admin_required(fn):
             return redirect(url_for("search_page"))
         return fn(*a, **k)
     return wrapper
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Access control (authoritative — derived from the session, never the client)
+# ─────────────────────────────────────────────────────────────────────────────
+def _current_access():
+    """What the signed-in user may reach: the list of departments they can browse
+    and whether they may download (vs view-only). Admins get every department and
+    full download rights."""
+    if session.get("role") == "admin":
+        return {"departments": list(s3_service.DEPARTMENTS), "can_download": True}
+    info = auth.user_access(session.get("user", ""))
+    # Intersect with the departments that actually exist, so a stale grant can't
+    # widen access if a department is renamed/removed in config.
+    depts = [d for d in info["departments"] if d in s3_service.DEPARTMENTS]
+    return {"departments": depts, "can_download": bool(info["can_download"])}
+
+
+def _clean_departments(raw):
+    """Keep only known department names from an admin-supplied list (drops typos /
+    anything not in DEPARTMENTS)."""
+    if not isinstance(raw, list):
+        return []
+    valid = set(s3_service.DEPARTMENTS)
+    seen, out = set(), []
+    for d in raw:
+        if d in valid and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,7 +160,16 @@ def logout():
 @login_required
 def api_filters():
     try:
-        opts = s3_service.filter_options()
+        access = _current_access()
+        opts = s3_service.filter_options(departments=access["departments"])
+        # Show the user's full assigned set (even a department with no files yet),
+        # not just the ones that happen to have records.
+        opts["departments"] = sorted(access["departments"], key=str.lower)
+        hbd = opts.get("hosts_by_department", {})
+        for d in access["departments"]:
+            hbd.setdefault(d, [])          # a department with no files yet -> no hosts
+        opts["hosts_by_department"] = hbd
+        opts["can_download"] = access["can_download"]
         opts["cache"] = s3_service.cache_info()
         return jsonify(opts)
     except Exception as e:
@@ -140,6 +180,7 @@ def api_filters():
 @login_required
 def api_search():
     try:
+        access = _current_access()
         results, total, total_size = s3_service.search(
             candidate=request.args.get("candidate", ""),
             company=request.args.get("company", ""),
@@ -147,12 +188,15 @@ def api_search():
             meeting_id=request.args.get("meeting_id", ""),
             file_type=request.args.get("file_type", ""),
             host=request.args.get("host", ""),
+            department=request.args.get("department", ""),
+            allowed_departments=access["departments"],
         )
         return jsonify({
             "count": len(results),
             "total": total,
             "truncated": total > len(results),
             "total_size": total_size,
+            "can_download": access["can_download"],
             "results": results,
         })
     except Exception as e:
@@ -176,16 +220,16 @@ def api_refresh():
 @login_required
 def api_download_one():
     key = request.args.get("key", "")
-    if not key or not key.startswith(s3_service.ROOT_PREFIX):
-        abort(400, "Invalid key.")
-    if not s3_service._key_exists(key):
+    access = _current_access()
+    if not access["can_download"]:
+        abort(403, "Your account is view-only — downloads are disabled.")
+    if not s3_service.key_allowed(key, access["departments"]):
         abort(404, "File not found.")
 
     if s3_service.DEMO_MODE:
         data, fname = s3_service.demo_file_response(key)
         if data is None:
             abort(404)
-        import io
         return send_file(io.BytesIO(data), as_attachment=True,
                          download_name=fname, mimetype="text/plain")
 
@@ -195,12 +239,60 @@ def api_download_one():
         return jsonify({"error": _s3_err(e)}), 502
 
 
+@app.route("/api/view")
+@login_required
+def api_view_one():
+    """Inline, view-only access to a file. Returns a presigned URL with an 'inline'
+    disposition (so the browser plays/renders it) instead of forcing a download.
+    Available to every signed-in user for files in their allowed departments —
+    including view-only accounts that may not use /api/download."""
+    key = request.args.get("key", "")
+    access = _current_access()
+    if not s3_service.key_allowed(key, access["departments"]):
+        abort(404, "File not found.")
+
+    if s3_service.DEMO_MODE:
+        data, fname = s3_service.demo_file_response(key)
+        if data is None:
+            abort(404)
+        # as_attachment=False -> served inline
+        return send_file(io.BytesIO(data), download_name=fname, mimetype="text/plain")
+
+    # Text files (transcripts, chat, notes, HTML…) are proxied THROUGH the app so
+    # the preview's fetch() is same-origin and not blocked by S3 CORS. Media and
+    # anything large is redirected straight to S3 (keeps big bytes off the server).
+    if s3_service.is_text_preview(key):
+        try:
+            data, ctype = s3_service.get_object_bytes(key)
+        except ValueError:
+            # Too big to proxy — fall back to a direct inline S3 link.
+            try:
+                return redirect(s3_service.presigned_url(key, inline=True))
+            except Exception as e:
+                return jsonify({"error": _s3_err(e)}), 502
+        except Exception as e:
+            return jsonify({"error": _s3_err(e)}), 502
+        # content_type (not mimetype) so a charset already in ctype isn't doubled.
+        resp = app.response_class(data, content_type=ctype)
+        resp.headers["Content-Disposition"] = "inline"
+        resp.headers["X-Content-Type-Options"] = "nosniff"
+        return resp
+
+    try:
+        return redirect(s3_service.presigned_url(key, inline=True))
+    except Exception as e:
+        return jsonify({"error": _s3_err(e)}), 502
+
+
 @app.route("/api/download/bulk", methods=["POST"])
 @login_required
 def api_download_bulk():
+    access = _current_access()
+    if not access["can_download"]:
+        return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
     data = request.get_json(silent=True) or {}
     keys = data.get("keys") or []
-    keys = [k for k in keys if isinstance(k, str) and k.startswith(s3_service.ROOT_PREFIX)]
+    keys = [k for k in keys if isinstance(k, str) and s3_service.key_allowed(k, access["departments"])]
     if not keys:
         return jsonify({"error": "No files selected."}), 400
 
@@ -234,6 +326,7 @@ def api_users_list():
     return jsonify({
         "admins": sorted(auth.get_admins().keys(), key=str.lower),
         "users": auth.list_users(),
+        "departments": list(s3_service.DEPARTMENTS),
     })
 
 
@@ -242,11 +335,29 @@ def api_users_list():
 def api_users_create():
     data = request.get_json(silent=True) or {}
     try:
-        auth.create_user(data.get("username", ""), data.get("password", ""),
-                         created_by=session.get("user", ""))
+        auth.create_user(
+            data.get("username", ""), data.get("password", ""),
+            created_by=session.get("user", ""),
+            departments=_clean_departments(data.get("departments")),
+            can_download=bool(data.get("can_download", False)),
+        )
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
+
+
+@app.route("/api/admin/users/<username>", methods=["PATCH"])
+@admin_required
+def api_users_update(username):
+    """Update an existing user's department grant and/or download permission."""
+    data = request.get_json(silent=True) or {}
+    departments = _clean_departments(data.get("departments")) if "departments" in data else None
+    can_download = bool(data["can_download"]) if "can_download" in data else None
+    try:
+        auth.update_user_access(username, departments=departments, can_download=can_download)
+        return jsonify({"ok": True})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
 
 
 @app.route("/api/admin/users/<username>", methods=["DELETE"])

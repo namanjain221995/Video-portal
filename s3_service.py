@@ -3,16 +3,21 @@ s3_service.py
 -------------
 All S3 access for the Interview-Success recording portal lives here.
 
-The bucket contains TWO key layouts (both handled by _parse_key):
+The bucket has several department folders at the top level (HR, Interview-Success,
+Marketing, …). The FIRST path segment is the department; below it there are THREE
+key layouts (all handled by _parse_key):
 
-    Layout A (10 segments after the prefix):
-        Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{MeetingID}/{FileType}/{file}
-    Layout B (11 segments after the prefix — an extra MeetingID + a Time-*-IST folder):
-        Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{MeetingID}/{Company}/{Date}/{Round}/{Time-*-IST}/{FileType}/{file}
+    Layout A (10 segments below the department) — Interview-Success:
+        {Dept}/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{MeetingID}/{FileType}/{file}
+    Layout B (11 segments — extra MeetingID + a Time-*-IST folder) — Interview-Success:
+        {Dept}/{Host}/{Year}/{Month}/{Candidate}/{MeetingID}/{Company}/{Date}/{Round}/{Time-*-IST}/{FileType}/{file}
+    Layout C (9 segments — NO Company/Round, has a Time-*-IST folder) — HR/Marketing/Training/…:
+        {Dept}/{Host}/{Year}/{Month}/{Candidate}/{Date}/{Time-*-IST}/{MeetingID}/{FileType}/{file}
 
-Reliable anchors in BOTH layouts:  candidate = seg[3], file_type = seg[-2],
-filename = seg[-1], the date matches YYYY-MM-DD, the meeting id is the all-digit
-segment, company is the segment right before the date and round the one right after.
+Reliable anchors in ALL layouts:  department = seg[0], host/year/month/candidate =
+the next four, file_type = seg[-2], filename = seg[-1]; the date matches YYYY-MM-DD,
+the meeting id is the all-digit segment, company is the label just before the date
+and round the one just after (absent in layout C, which has neither).
 
 The module lists everything under Interview-Success/, parses each key into a
 structured record, caches the result (TTL + a shared on-disk index so the 3
@@ -32,6 +37,7 @@ import time
 import zipfile
 import tempfile
 import threading
+import mimetypes
 
 import boto3
 from botocore.config import Config
@@ -42,6 +48,14 @@ from botocore.config import Config
 BUCKET       = os.environ.get("S3_BUCKET_NAME", "zoom-automation-bucket")
 ROOT_PREFIX  = os.environ.get("ROOT_PREFIX", "Interview-Success/")
 REGION       = os.environ.get("AWS_REGION", "us-east-1")
+# Top-level "department" folders in the bucket. Each holds the same internal
+# layout ({Host}/{Year}/{Month}/{Candidate}/…). The portal scans every one of
+# these and tags each record with its department; access is then granted per
+# user by an admin. Override via DEPARTMENTS="HR,Marketing,…" in .env.
+DEPARTMENTS  = [d.strip() for d in os.environ.get(
+    "DEPARTMENTS",
+    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere",
+).split(",") if d.strip()]
 CACHE_TTL    = int(os.environ.get("CACHE_TTL_SEC", "300"))
 URL_EXPIRY   = int(os.environ.get("PRESIGNED_URL_EXPIRY_SEC", "3600"))
 DEMO_MODE    = os.environ.get("DEMO_MODE", "false").strip().lower() in ("1", "true", "yes")
@@ -57,6 +71,11 @@ INDEX_FILE   = os.environ.get("INDEX_FILE", "").strip()
 # but S3 is only re-scanned when the shared index is older than INDEX_TTL (or via
 # the manual "Refresh index" button). Recordings change slowly, so this is generous.
 INDEX_TTL    = int(os.environ.get("INDEX_REFRESH_SEC", "1800"))
+# How long a single full bucket scan may take before peers assume the scanning
+# worker died. Must comfortably exceed a real scan (≈3 min for ~80k files across
+# all departments), otherwise losers steal the lock / scan themselves and every
+# worker re-lists S3 at once on a cold boot. Also caps the loser wait.
+SCAN_TIMEOUT = int(os.environ.get("SCAN_TIMEOUT_SEC", "900"))
 
 if not ROOT_PREFIX.endswith("/"):
     ROOT_PREFIX += "/"
@@ -120,10 +139,17 @@ def _client():
 # Key parsing (layout-aware — see module docstring)
 # ─────────────────────────────────────────────────────────────────────────────
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# Some departments insert a "Time-8-30-PM-IST" folder where Interview-Success has
+# a Round. It must never be read as a company or round.
+_TIME_RE = re.compile(r"^time-.*ist$", re.I)
+
+
+def _is_time(s: str) -> bool:
+    return bool(_TIME_RE.match(s or ""))
 
 # Low-cardinality fields are interned so the 50k records don't hold 50k copies of
 # the same ~21 hosts / ~8 file-types / handful of dates — a big per-worker RAM win.
-_INTERN_FIELDS = ("host", "year", "month", "company", "date", "round",
+_INTERN_FIELDS = ("department", "host", "year", "month", "company", "date", "round",
                   "file_type", "category", "ext")
 
 
@@ -137,9 +163,14 @@ def _intern_rec(d: dict) -> dict:
 
 def _parse_key(key: str, size):
     """Turn an S3 key into a structured record, or None if it is not a leaf file
-    under the expected Interview-Success layout (folder placeholders, short keys)."""
-    seg = key.split("/")[_ROOT_DEPTH:]   # drop the Interview-Success/ prefix
-    if len(seg) < 10:
+    under the expected {Department}/{Host}/… layout (folder placeholders, short keys).
+
+    The first path segment is the department (HR, Interview-Success, …); the rest
+    is the per-department layout the parser already understood."""
+    parts = key.split("/")
+    department = parts[0]
+    seg = parts[1:]                      # everything below the department folder
+    if len(seg) < 9:
         return None
 
     filename = seg[-1].strip()
@@ -150,21 +181,28 @@ def _parse_key(key: str, size):
     file_type = seg[-2]
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
 
-    # Everything between the candidate and the file_type folder. Layout A holds
-    # [Company, Date, Round, MeetingID]; Layout B holds
-    # [MeetingID, Company, Date, Round, Time-*-IST]. Anchor on the date.
+    # Everything between the candidate and the file_type folder, across layouts:
+    #   Interview-Success A (10 seg): [Company, Date, Round, MeetingID]
+    #   Interview-Success B (11 seg): [MeetingID, Company, Date, Round, Time-*-IST]
+    #   Other depts        C ( 9 seg): [Date, Time-*-IST, MeetingID]  (no Company/Round)
+    # Anchor on the date: company sits just before it, round just after — but only
+    # if that neighbour is a real label (not the meeting id and not a Time-*-IST
+    # folder), so layout C correctly yields empty company/round.
     mid = seg[4:-2]
     company = date = rnd = ""
     di = next((i for i, s in enumerate(mid) if _DATE_RE.match(s)), None)
     if di is not None:
         date = mid[di]
-        if di - 1 >= 0:
-            company = mid[di - 1]
-        if di + 1 < len(mid):
-            rnd = mid[di + 1]
+        prev = mid[di - 1] if di - 1 >= 0 else ""
+        nxt  = mid[di + 1] if di + 1 < len(mid) else ""
+        if prev and not prev.isdigit() and not _is_time(prev):
+            company = prev
+        if nxt and not nxt.isdigit() and not _is_time(nxt):
+            rnd = nxt
     meeting_id = next((s for s in mid if s.isdigit()), "")
 
     return _intern_rec({
+        "department": department,
         "host":       host,
         "year":       year,
         "month":      month,
@@ -189,11 +227,14 @@ def _scan_s3():
     client = _client()
     records = []
     paginator = client.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=BUCKET, Prefix=ROOT_PREFIX):
-        for obj in page.get("Contents", []):
-            rec = _parse_key(obj["Key"], obj.get("Size", 0))
-            if rec:
-                records.append(rec)
+    # List each department folder separately so an unrelated top-level prefix in
+    # the bucket can never leak into the index.
+    for dept in DEPARTMENTS:
+        for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{dept}/"):
+            for obj in page.get("Contents", []):
+                rec = _parse_key(obj["Key"], obj.get("Size", 0))
+                if rec:
+                    records.append(rec)
     return records
 
 
@@ -220,7 +261,7 @@ def _lock_path():
     return (INDEX_FILE + ".lock") if INDEX_FILE else None
 
 
-def _acquire_scan_lock(stale_sec=180):
+def _acquire_scan_lock(stale_sec=SCAN_TIMEOUT):
     """Atomically claim the right to re-list S3. Returns True if THIS process won.
     A lock older than stale_sec is assumed orphaned (worker died mid-scan) and stolen."""
     path = _lock_path()
@@ -267,7 +308,7 @@ def _rebuild_from_s3(force):
         finally:
             _release_scan_lock()
     # Lost the election: wait for the winner to publish, then load it.
-    deadline = time.time() + 150
+    deadline = time.time() + SCAN_TIMEOUT
     while time.time() < deadline:
         time.sleep(1.0)
         recs = _load_disk_index(INDEX_TTL)
@@ -303,8 +344,12 @@ def _save_disk_index(records):
 
 def _build_options(records):
     """Distinct values for the (small) server-side dropdowns. Company is now a
-    free-text input and file-type is a static category list, so only hosts remain."""
-    return {"hosts": sorted({r["host"] for r in records}, key=str.lower)}
+    free-text input and file-type is a static category list, so hosts +
+    departments remain."""
+    return {
+        "hosts":       sorted({r["host"] for r in records}, key=str.lower),
+        "departments": sorted({r["department"] for r in records}, key=str.lower),
+    }
 
 
 def get_records(force: bool = False):
@@ -374,38 +419,74 @@ def _match_candidate(query: str, candidate: str) -> bool:
     return all(tok in c for tok in q.split())
 
 
-def filter_options(block: bool = False):
-    """Values for the server-side dropdowns (just hosts now). Non-blocking by
+def filter_options(departments=None, block: bool = False):
+    """Values for the server-side dropdowns (hosts + departments). Non-blocking by
     default: returns whatever is already cached so a page load never triggers a
-    ~27s S3 scan. Pass block=True to force the index to be built first."""
+    ~27s S3 scan. Pass block=True to force the index to be built first.
+
+    When `departments` is given (a user's allowed set), hosts are scoped to those
+    departments so a user never sees host names from departments they can't access."""
     if DEMO_MODE:
-        return {"hosts": sorted({r["host"] for r in DEMO_RECORDS}, key=str.lower)}
-    if block:
-        get_records()
-    with _lock:
-        opts = _cache["options"]
-    return dict(opts) if opts else {"hosts": []}
+        recs = DEMO_RECORDS
+    else:
+        if block:
+            get_records()
+        with _lock:
+            recs = _cache["records"]
+        if not recs:
+            return {"hosts": [], "departments": []}
+
+    if departments is not None:
+        allowed = set(departments)
+        recs = [r for r in recs if r["department"] in allowed]
+
+    # Hosts grouped per department, so the UI can narrow the Host dropdown to the
+    # chosen department instead of always showing every allowed department's hosts.
+    by_dept = {}
+    for r in recs:
+        by_dept.setdefault(r["department"], set()).add(r["host"])
+    hosts_by_department = {d: sorted(hs, key=str.lower) for d, hs in by_dept.items()}
+    all_hosts = sorted({h for hs in by_dept.values() for h in hs}, key=str.lower)
+
+    return {
+        "hosts":               all_hosts,                                   # union (All departments)
+        "departments":         sorted(by_dept.keys(), key=str.lower),
+        "hosts_by_department": hosts_by_department,
+    }
 
 
-def search(candidate="", company="", date="", meeting_id="", file_type="", host="", limit=None):
+def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
+           department="", allowed_departments=None, limit=None):
     """Filter the index. Returns (rows, total, total_size) where rows is capped at
     `limit` (default RESULT_LIMIT) but total/total_size reflect the FULL match set.
 
+    `allowed_departments` is the access mask for the signed-in user: records outside
+    it are dropped BEFORE any other filter, so a user can never reach a department
+    they were not granted (admins pass the full list). `department` is an optional
+    user-chosen narrowing within that allowed set.
+
     Empty query short-circuits to ([], 0, 0) WITHOUT touching S3 — so landing the
-    page (or a blank submit) never scans or serialises the whole bucket."""
+    page (or a blank submit) never scans or serialises the whole bucket. The access
+    mask is NOT counted as a query, so a blank submit still returns nothing."""
     candidate  = (candidate or "").strip()
     company    = (company or "").strip().lower()
     date       = (date or "").strip().lower()
     meeting_id = (meeting_id or "").strip().lower()
     file_type  = (file_type or "").strip().lower()   # a category key (video/audio/…)
     host       = (host or "").strip().lower()
+    department = (department or "").strip()
 
-    if not any([candidate, company, date, meeting_id, file_type, host]):
+    if not any([candidate, company, date, meeting_id, file_type, host, department]):
         return [], 0, 0
 
+    allowed = set(allowed_departments) if allowed_departments is not None else None
     recs = get_records()
     out = []
     for r in recs:
+        if allowed is not None and r["department"] not in allowed:   # access mask first
+            continue
+        if department and department != r["department"]:
+            continue
         if not _match_candidate(candidate, r["candidate"]):
             continue
         if company and company not in r["company"].lower():     # substring, free-text
@@ -420,7 +501,7 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
             continue
         out.append(r)
 
-    out.sort(key=lambda r: (r["candidate"].lower(), r["date"], r["meeting_id"], r["file_type"]))
+    out.sort(key=lambda r: (r["department"].lower(), r["candidate"].lower(), r["date"], r["meeting_id"], r["file_type"]))
     total = len(out)
     total_size = sum(r["size"] for r in out)
     lim = RESULT_LIMIT if limit is None else limit
@@ -434,18 +515,82 @@ def _key_exists(key: str) -> bool:
     return key in _records_by_key()
 
 
-def presigned_url(key: str) -> str:
-    """Temporary direct-to-S3 download link (keeps EC2 out of the data path)."""
+def department_of(key: str) -> str:
+    """The top-level department folder a key belongs to ('' for a malformed key)."""
+    return key.split("/", 1)[0] if key else ""
+
+
+def key_allowed(key: str, allowed_departments) -> bool:
+    """Server-side gate for download/view: the key must exist in the index AND sit
+    in a department the caller was granted. Never trust a key from the client alone."""
+    if not key:
+        return False
+    if department_of(key) not in (allowed_departments or []):
+        return False
+    return _key_exists(key)
+
+
+# Mime types we want the browser to render/play inline (the rest fall back to
+# Python's mimetypes guess). m4a is audio/mp4; vtt is text/vtt.
+_INLINE_CONTENT_TYPES = {
+    "mp4":  "video/mp4",
+    "m4a":  "audio/mp4",
+    "vtt":  "text/vtt; charset=utf-8",
+    "txt":  "text/plain; charset=utf-8",
+    "html": "text/html; charset=utf-8",
+}
+
+
+def content_type_for(filename: str) -> str:
+    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
+    return _INLINE_CONTENT_TYPES.get(ext) or mimetypes.guess_type(filename)[0] or ""
+
+
+# Small text-ish files are proxied through the app for inline preview (same-origin,
+# so the browser's fetch() isn't blocked by S3 CORS). Media stays a direct redirect.
+_TEXT_PREVIEW_EXTS = {"vtt", "txt", "html", "htm", "json", "csv", "srt", "log", "md"}
+# Hard ceiling so a mislabelled huge file can never be slurped into app memory.
+TEXT_PREVIEW_MAX_BYTES = int(os.environ.get("TEXT_PREVIEW_MAX_BYTES", str(15 * 1024 * 1024)))
+
+
+def is_text_preview(key: str) -> bool:
+    fn = key.rsplit("/", 1)[-1]
+    ext = fn.rsplit(".", 1)[-1].lower() if "." in fn else ""
+    return ext in _TEXT_PREVIEW_EXTS
+
+
+def get_object_bytes(key: str, max_bytes: int = TEXT_PREVIEW_MAX_BYTES):
+    """Read an object's bytes (capped) for in-app preview. Returns (data, content_type).
+    Raises if the object is larger than max_bytes so we never blow up memory."""
+    obj = _client().get_object(Bucket=BUCKET, Key=key)
+    length = obj.get("ContentLength")
+    if length is not None and length > max_bytes:
+        raise ValueError("File too large to preview in-app (%d bytes)." % length)
+    data = obj["Body"].read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError("File too large to preview in-app.")
+    ctype = content_type_for(key.rsplit("/", 1)[-1]) or obj.get("ContentType") or "text/plain; charset=utf-8"
+    return data, ctype
+
+
+def presigned_url(key: str, inline: bool = False) -> str:
+    """Temporary direct-to-S3 link (keeps EC2 out of the data path).
+
+    inline=False  -> 'attachment' (forces a download, used by the download buttons).
+    inline=True   -> 'inline' + a sensible Content-Type, so the browser plays/renders
+                     the file in place. Used by /api/view for view-only access."""
     filename = key.rsplit("/", 1)[-1]
-    return _client().generate_presigned_url(
-        "get_object",
-        Params={
-            "Bucket": BUCKET,
-            "Key": key,
-            "ResponseContentDisposition": f'attachment; filename="{filename}"',
-        },
-        ExpiresIn=URL_EXPIRY,
-    )
+    disposition = "inline" if inline else "attachment"
+    params = {
+        "Bucket": BUCKET,
+        "Key": key,
+        "ResponseContentDisposition": f'{disposition}; filename="{filename}"',
+    }
+    if inline:
+        ct = content_type_for(filename)
+        if ct:
+            params["ResponseContentType"] = ct
+    return _client().generate_presigned_url("get_object", Params=params, ExpiresIn=URL_EXPIRY)
 
 
 def _flat_name(rec: dict) -> str:
@@ -488,10 +633,10 @@ def build_zip(keys):
 # ─────────────────────────────────────────────────────────────────────────────
 # DEMO MODE — sample data + fake file bytes so the UI is fully testable offline
 # ─────────────────────────────────────────────────────────────────────────────
-def _mk(host, cand, company, date, rnd, mid, files):
+def _mk(dept, host, cand, company, date, rnd, mid, files):
     out = []
     for ft, fname, size in files:
-        key = f"Interview-Success/{host}/2026/June/{cand}/{company}/{date}/{rnd}/{mid}/{ft}/{fname}"
+        key = f"{dept}/{host}/2026/June/{cand}/{company}/{date}/{rnd}/{mid}/{ft}/{fname}"
         rec = _parse_key(key, size)
         if rec:
             out.append(rec)
@@ -499,30 +644,30 @@ def _mk(host, cand, company, date, rnd, mid, files):
 
 
 DEMO_RECORDS = []
-DEMO_RECORDS += _mk("Vivek_Parmar", "Akhilendra_NA_Sirikonda", "Gartner", "2026-06-10",
-                    "Introduction_Call", "96355112813",
+DEMO_RECORDS += _mk("Interview-Success", "Vivek_Parmar", "Akhilendra_NA_Sirikonda", "Gartner",
+                    "2026-06-10", "Introduction_Call", "96355112813",
                     [("MP4", "rec_96355112813.mp4", 184_000_000),
                      ("M4A", "audio_96355112813.m4a", 12_400_000),
                      ("TRANSCRIPT", "transcript_96355112813.vtt", 84_120)])
-DEMO_RECORDS += _mk("Vivek_Parmar", "Aditya_Walker", "Amazon", "2026-06-12",
-                    "Technical_Round_1", "96355119001",
+DEMO_RECORDS += _mk("Interview-Success", "Vivek_Parmar", "Aditya_Walker", "Amazon",
+                    "2026-06-12", "Technical_Round_1", "96355119001",
                     [("MP4", "rec_96355119001.mp4", 221_000_000),
                      ("TRANSCRIPT", "transcript_96355119001.vtt", 91_300)])
-DEMO_RECORDS += _mk("Abhishek_Jain", "Chaitanya_Nenavath", "Google", "2026-06-15",
-                    "HR_Round", "96355120044",
+DEMO_RECORDS += _mk("Interview-Success", "Abhishek_Jain", "Chaitanya_Nenavath", "Google",
+                    "2026-06-15", "HR_Round", "96355120044",
                     [("MP4", "rec_96355120044.mp4", 142_000_000),
                      ("M4A", "audio_96355120044.m4a", 9_800_000)])
-DEMO_RECORDS += _mk("Abhishek_Jain", "Sanjana_Gupta", "Amazon", "2026-06-15",
-                    "Technical_Round_2", "96355120099",
+DEMO_RECORDS += _mk("HR", "Abhishek_Jain", "Sanjana_Gupta", "Amazon",
+                    "2026-06-15", "Technical_Round_2", "96355120099",
                     [("MP4", "rec_96355120099.mp4", 305_000_000),
                      ("M4A", "audio_96355120099.m4a", 15_100_000),
                      ("TRANSCRIPT", "transcript_96355120099.vtt", 102_400)])
-DEMO_RECORDS += _mk("Ishita_Aggarwal", "Bala_Praneeth_Reddy_Basani", "Gartner", "2026-06-18",
-                    "Final_Round", "96355121200",
+DEMO_RECORDS += _mk("Marketing", "Ishita_Aggarwal", "Bala_Praneeth_Reddy_Basani", "Gartner",
+                    "2026-06-18", "Final_Round", "96355121200",
                     [("MP4", "rec_96355121200.mp4", 198_000_000),
                      ("TRANSCRIPT", "transcript_96355121200.vtt", 77_900)])
-DEMO_RECORDS += _mk("Ishita_Aggarwal", "Dharani_Katta", "Microsoft", "2026-06-20",
-                    "Introduction_Call", "96355121888",
+DEMO_RECORDS += _mk("Training", "Ishita_Aggarwal", "Dharani_Katta", "Microsoft",
+                    "2026-06-20", "Introduction_Call", "96355121888",
                     [("MP4", "rec_96355121888.mp4", 167_000_000),
                      ("M4A", "audio_96355121888.m4a", 11_200_000),
                      ("TRANSCRIPT", "transcript_96355121888.vtt", 65_400)])

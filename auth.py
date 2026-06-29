@@ -22,6 +22,11 @@ from werkzeug.security import generate_password_hash, check_password_hash
 USERS_FILE = os.environ.get("USERS_FILE", "users.json")
 _lock = threading.Lock()
 
+# Departments granted to users created before per-department access existed (i.e.
+# records with no "departments" field). The portal historically only served
+# Interview-Success, so that preserves exactly what they could already see.
+LEGACY_DEFAULT_DEPTS = ["Interview-Success"]
+
 
 # ── Admins (from .env) ───────────────────────────────────────────────────────
 def get_admins() -> dict:
@@ -60,13 +65,29 @@ def _save_users(users: dict) -> None:
 def list_users() -> list:
     users = _load_users()
     return sorted(
-        ({"username": u, "created_at": d.get("created_at"), "created_by": d.get("created_by")}
+        ({"username": u,
+          "created_at": d.get("created_at"),
+          "created_by": d.get("created_by"),
+          "departments": d.get("departments", list(LEGACY_DEFAULT_DEPTS)),
+          "can_download": bool(d.get("can_download", True))}
          for u, d in users.items()),
         key=lambda x: x["username"].lower(),
     )
 
 
-def create_user(username: str, password: str, created_by: str = "") -> None:
+def user_access(username: str) -> dict:
+    """The access a normal user was granted: which departments they may browse and
+    whether they may download (vs view-only). Missing fields fall back to the
+    legacy defaults so pre-existing accounts keep working unchanged."""
+    rec = _load_users().get((username or "").strip()) or {}
+    depts = rec.get("departments")
+    if depts is None:
+        depts = list(LEGACY_DEFAULT_DEPTS)
+    return {"departments": list(depts), "can_download": bool(rec.get("can_download", True))}
+
+
+def create_user(username: str, password: str, created_by: str = "",
+                departments=None, can_download: bool = True) -> None:
     username = (username or "").strip()
     if not username or not password:
         raise ValueError("Username and password are both required.")
@@ -82,7 +103,25 @@ def create_user(username: str, password: str, created_by: str = "") -> None:
             "password": generate_password_hash(password),
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "created_by": created_by,
+            "departments": list(departments or []),
+            "can_download": bool(can_download),
         }
+        _save_users(users)
+
+
+def update_user_access(username: str, departments=None, can_download=None) -> None:
+    """Change an existing user's department grant and/or download permission.
+    Pass None for a field to leave it unchanged."""
+    username = (username or "").strip()
+    with _lock:
+        users = _load_users()
+        rec = users.get(username)
+        if rec is None:
+            raise ValueError("No such user.")
+        if departments is not None:
+            rec["departments"] = list(departments)
+        if can_download is not None:
+            rec["can_download"] = bool(can_download)
         _save_users(users)
 
 
