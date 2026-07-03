@@ -54,7 +54,7 @@ REGION       = os.environ.get("AWS_REGION", "us-east-1")
 # user by an admin. Override via DEPARTMENTS="HR,Marketing,…" in .env.
 DEPARTMENTS  = [d.strip() for d in os.environ.get(
     "DEPARTMENTS",
-    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere",
+    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere,Executive-Assistant",
 ).split(",") if d.strip()]
 CACHE_TTL    = int(os.environ.get("CACHE_TTL_SEC", "300"))
 URL_EXPIRY   = int(os.environ.get("PRESIGNED_URL_EXPIRY_SEC", "3600"))
