@@ -63,6 +63,12 @@ DEMO_MODE    = os.environ.get("DEMO_MODE", "false").strip().lower() in ("1", "tr
 # Max rows returned by a single search (keeps the JSON payload + browser table
 # bounded — a broad filter could otherwise match >10k files).
 RESULT_LIMIT = int(os.environ.get("SEARCH_RESULT_LIMIT", "500"))
+# Hard server-side bounds for a temporary bulk ZIP. These protect local disk,
+# S3 bandwidth and a Gunicorn worker even when a client crafts its own request.
+BULK_ZIP_MAX_FILES = max(1, int(os.environ.get("BULK_ZIP_MAX_FILES", "250")))
+BULK_ZIP_MAX_BYTES = max(1, int(os.environ.get(
+    "BULK_ZIP_MAX_BYTES", str(10 * 1024 * 1024 * 1024),
+)))
 # Optional shared on-disk index (set to a path on a persistent volume, e.g.
 # /data/index.json in Docker). When set, workers load the parsed index from this
 # file instead of each re-listing the whole bucket, and it survives restarts.
@@ -627,14 +633,27 @@ def key_allowed(key: str, allowed_departments, allowed_hosts=None) -> bool:
     """Server-side gate for download/view: the key must exist in the index, sit in
     a department the caller was granted AND (when a host restriction applies) be
     hosted by one of their granted hosts. Never trust a key from the client alone."""
+    return authorized_record(key, allowed_departments, allowed_hosts) is not None
+
+
+def authorized_record(key: str, allowed_departments, allowed_hosts=None):
+    """Return the indexed record when ``key`` is inside the caller's access mask.
+
+    Routes that need recording metadata (for example the audit log) use this
+    helper so authorization and metadata lookup are one atomic decision against
+    the same cached index.  ``None`` deliberately covers both an unknown key and
+    a known-but-forbidden key, preventing callers from learning which one it was.
+    """
     if not key:
-        return False
+        return None
     rec = _records_by_key().get(key)
     if rec is None:
-        return False
+        return None
     if rec["department"] not in (allowed_departments or []):
-        return False
-    return _host_allowed(rec, allowed_hosts)
+        return None
+    if not _host_allowed(rec, allowed_hosts):
+        return None
+    return rec
 
 
 # Mime types we want the browser to render/play inline (the rest fall back to

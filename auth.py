@@ -137,12 +137,14 @@ def update_user_access(username: str, departments=None, hosts=None, can_download
         _save_users(users)
 
 
-def delete_user(username: str) -> None:
+def delete_user(username: str) -> bool:
     with _lock:
         users = _load_users()
         if username in users:
             del users[username]
             _save_users(users)
+            return True
+    return False
 
 
 # ── Verification ─────────────────────────────────────────────────────────────

@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block title %}Activity logs · Recording Portal{% endblock %}
+
+{% block body %}
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand"><span class="mark"><img src="{{ asset('techsara-logo.webp') }}" alt="Techsara"></span> Recording Portal</div>
+    <span class="badge badge-admin">ADMIN</span>
+    <div class="spacer"></div>
+    <span class="who">Signed in as <strong>{{ username }}</strong></span>
+    <a class="navlink" href="{{ url_for('search_page') }}">Search</a>
+    <a class="navlink" href="{{ url_for('admin_page') }}">Admin</a>
+    <a class="navlink" href="{{ url_for('logs_page') }}" aria-current="page">Logs</a>
+    <a class="navlink" href="{{ url_for('logout') }}">Log out</a>
+  </div>
+</header>
+
+<main class="container">
+  <div class="page-head logs-page-head">
+    <div>
+      <h1>Activity logs</h1>
+      <p>Review sign-ins, searches, preview opens, downloads, and administrative changes. Times below use this device's local timezone.</p>
+      <p class="logs-caveat">A preview-open event confirms that the recording was opened; it does not measure how long the recording was watched.</p>
+    </div>
+  </div>
+
+  <div id="notice" class="notice" role="alert"></div>
+
+  <section class="card card-pad">
+    <form id="logs-form">
+      <div class="logs-filters">
+        <div class="field">
+          <label for="f-action">Action</label>
+          <select class="input" id="f-action">
+            <option value="">All actions</option>
+          </select>
+        </div>
+        <div class="field">
+          <label for="f-username">User</label>
+          <select class="input" id="f-username">
+            <option value="">All users</option>
+          </select>
+        </div>
+        <div class="field logs-query-field">
+          <label for="f-query">Search log details</label>
+          <input class="input" id="f-query" type="search" placeholder="Candidate, host, meeting ID, department…" autocomplete="off">
+        </div>
+        <div class="field">
+          <label for="f-date-from">Activity from</label>
+          <input class="input" id="f-date-from" type="date">
+        </div>
+        <div class="field">
+          <label for="f-date-to">Activity to</label>
+          <input class="input" id="f-date-to" type="date">
+        </div>
+      </div>
+
+      <div class="filters-actions">
+        <button class="btn btn-primary" id="btn-apply" type="submit">Apply filters</button>
+        <button class="btn btn-ghost" id="btn-clear-logs" type="button">Clear filters</button>
+      </div>
+    </form>
+  </section>
+
+  <div class="results-head">
+    <h2>Activity</h2>
+    <div class="spacer"></div>
+    <span class="summary" id="logs-summary"></span>
+    <label class="results-ctl" for="logs-per-page">Per page
+      <select class="input" id="logs-per-page">
+        <option value="25">25</option>
+        <option value="50" selected>50</option>
+        <option value="100">100</option>
+      </select>
+    </label>
+  </div>
+
+  <div id="logs-area" class="logs-area" aria-live="polite">
+    <div class="empty"><div class="spinner spinner-lg"></div>Loading activity…</div>
+  </div>
+
+  <div id="logs-pagination" class="pagination" aria-label="Activity log pages"></div>
+</main>
+
+<script src="{{ asset('logs.js') }}"></script>
+{% endblock %}

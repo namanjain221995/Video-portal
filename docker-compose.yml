@@ -18,9 +18,11 @@ services:
     env_file:
       - .env
 
-    # Keep created users on a persistent volume (survives rebuilds/restarts).
+    # Keep users, audit logs, and the parsed index across rebuilds/restarts.
     environment:
       USERS_FILE: /data/users.json
+      # Persistent admin activity log (SQLite, shared safely by all workers).
+      AUDIT_DB: /data/audit.db
       # Shared parsed S3 index on the persistent volume: workers load it instead
       # of each re-listing the bucket, and it survives restarts.
       INDEX_FILE: /data/index.json

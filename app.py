@@ -14,12 +14,15 @@ import functools
 from dotenv import load_dotenv
 load_dotenv()  # must run before importing modules that read os.environ at import time
 
+from werkzeug.wsgi import ClosingIterator
+
 from flask import (
     Flask, render_template, request, jsonify, session,
-    redirect, url_for, send_file, after_this_request, abort,
+    redirect, url_for, send_file, abort,
 )
 
 import auth
+import audit_service
 import s3_service
 
 app = Flask(__name__)
@@ -85,6 +88,40 @@ def _current_access():
     depts = [d for d in info["departments"] if d in s3_service.DEPARTMENTS]
     hosts = {d: hs for d, hs in (info.get("hosts") or {}).items() if d in depts and hs}
     return {"departments": depts, "hosts": hosts, "can_download": bool(info["can_download"])}
+
+
+def _audit(action, record=None, details=None, username=None, role=None,
+           success=True, dedupe_seconds=0, **fields):
+    """Best-effort audit event built from server-authoritative session/record data.
+
+    Audit failures never interrupt the user's request. Passwords and presigned
+    URLs are intentionally never passed to this helper.
+    """
+    payload = {
+        "username": session.get("user", "") if username is None else username,
+        "role": session.get("role", "") if role is None else role,
+        "success": success,
+        "dedupe_seconds": dedupe_seconds,
+        "details": dict(details or {}),
+    }
+    if record:
+        candidates = record.get("candidates") or [record.get("candidate", "")]
+        payload.update({
+            "candidate": ", ".join(str(c) for c in candidates if c),
+            "host": record.get("host", ""),
+            "meeting_id": record.get("meeting_id", ""),
+            "recording_date": record.get("date", ""),
+            "department": record.get("department", ""),
+            "file_type": record.get("file_type", ""),
+        })
+        payload["details"].update({
+            "company": record.get("company", ""),
+            "round": record.get("round", ""),
+            "filename": record.get("filename", ""),
+            "category": record.get("category", ""),
+        })
+    payload.update(fields)
+    return audit_service.record_event(action, **payload)
 
 
 def _clean_departments(raw):
@@ -156,24 +193,41 @@ def admin_page():
     return render_template("admin.html", username=session.get("user"))
 
 
+@app.route("/logs")
+@admin_required
+def logs_page():
+    response = app.make_response(render_template("logs.html", username=session.get("user")))
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Auth API
 # ─────────────────────────────────────────────────────────────────────────────
 @app.route("/api/login", methods=["POST"])
 def api_login():
-    data = request.get_json(silent=True) or request.form
-    username = (data.get("username") or "").strip()
+    json_data = request.get_json(silent=True)
+    if request.is_json and not isinstance(json_data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    data = json_data if json_data is not None else request.form
+    raw_username = data.get("username") or ""
+    username = raw_username.strip() if isinstance(raw_username, str) else ""
     password = data.get("password") or ""
+    if not isinstance(password, str):
+        password = ""
     role = auth.verify(username, password)
     if not role:
         return jsonify({"error": "Wrong username or password."}), 401
     session["user"] = username
     session["role"] = role
+    _audit("login", username=username, role=role)
     return jsonify({"ok": True, "username": username, "role": role})
 
 
 @app.route("/logout")
 def logout():
+    if session.get("user"):
+        _audit("logout")
     session.clear()
     return redirect(url_for("login_page"))
 
@@ -216,20 +270,43 @@ def api_search():
         access = _current_access()
         page = max(1, _int_arg("page", 1))
         per_page = max(1, min(_int_arg("per_page", 100), s3_service.RESULT_LIMIT))
+        filters = {
+            "candidate": request.args.get("candidate", ""),
+            "company": request.args.get("company", ""),
+            "date": request.args.get("date", ""),
+            "meeting_id": request.args.get("meeting_id", ""),
+            "file_type": request.args.get("file_type", ""),
+            "host": request.args.get("host", ""),
+            "department": request.args.get("department", ""),
+        }
+        sort = request.args.get("sort", "")
         results, total, total_size = s3_service.search(
-            candidate=request.args.get("candidate", ""),
-            company=request.args.get("company", ""),
-            date=request.args.get("date", ""),
-            meeting_id=request.args.get("meeting_id", ""),
-            file_type=request.args.get("file_type", ""),
-            host=request.args.get("host", ""),
-            department=request.args.get("department", ""),
+            **filters,
             allowed_departments=access["departments"],
             allowed_hosts=access["hosts"],
             limit=per_page,
             offset=(page - 1) * per_page,
-            sort=request.args.get("sort", ""),
+            sort=sort,
         )
+        if any(str(v or "").strip() for v in filters.values()):
+            _audit(
+                "search",
+                candidate=filters["candidate"],
+                host=filters["host"],
+                meeting_id=filters["meeting_id"],
+                recording_date=filters["date"],
+                department=filters["department"],
+                file_type=filters["file_type"],
+                details={
+                    "company": filters["company"],
+                    "page": page,
+                    "per_page": per_page,
+                    "sort": sort,
+                    "results_on_page": len(results),
+                    "total_results": total,
+                    "total_size": total_size,
+                },
+            )
         return jsonify({
             "count": len(results),
             "total": total,
@@ -250,8 +327,11 @@ def api_search():
 def api_refresh():
     try:
         s3_service.get_records(force=True)
-        return jsonify({"ok": True, "cache": s3_service.cache_info()})
+        cache = s3_service.cache_info()
+        _audit("refresh", details={"indexed_files": cache.get("count", 0)})
+        return jsonify({"ok": True, "cache": cache})
     except Exception as e:
+        _audit("refresh", success=False, details={"reason": "Index refresh failed"})
         return jsonify({"error": _s3_err(e)}), 502
 
 
@@ -265,18 +345,22 @@ def api_download_one():
     access = _current_access()
     if not access["can_download"]:
         abort(403, "Your account is view-only — downloads are disabled.")
-    if not s3_service.key_allowed(key, access["departments"], access["hosts"]):
+    rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
+    if rec is None:
         abort(404, "File not found.")
 
     if s3_service.DEMO_MODE:
         data, fname = s3_service.demo_file_response(key)
         if data is None:
             abort(404)
+        _audit("download", record=rec)
         return send_file(io.BytesIO(data), as_attachment=True,
                          download_name=fname, mimetype="text/plain")
 
     try:
-        return redirect(s3_service.presigned_url(key))
+        url = s3_service.presigned_url(key)
+        _audit("download", record=rec)
+        return redirect(url)
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
 
@@ -290,7 +374,8 @@ def api_view_one():
     including view-only accounts that may not use /api/download."""
     key = request.args.get("key", "")
     access = _current_access()
-    if not s3_service.key_allowed(key, access["departments"], access["hosts"]):
+    rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
+    if rec is None:
         abort(404, "File not found.")
 
     if s3_service.DEMO_MODE:
@@ -298,6 +383,7 @@ def api_view_one():
         if data is None:
             abort(404)
         # as_attachment=False -> served inline
+        _audit("view", record=rec)
         return send_file(io.BytesIO(data), download_name=fname, mimetype="text/plain")
 
     # Text files (transcripts, chat, notes, HTML…) are proxied THROUGH the app so
@@ -309,7 +395,9 @@ def api_view_one():
         except ValueError:
             # Too big to proxy — fall back to a direct inline S3 link.
             try:
-                return redirect(s3_service.presigned_url(key, inline=True))
+                url = s3_service.presigned_url(key, inline=True)
+                _audit("view", record=rec)
+                return redirect(url)
             except Exception as e:
                 return jsonify({"error": _s3_err(e)}), 502
         except Exception as e:
@@ -318,10 +406,13 @@ def api_view_one():
         resp = app.response_class(data, content_type=ctype)
         resp.headers["Content-Disposition"] = "inline"
         resp.headers["X-Content-Type-Options"] = "nosniff"
+        _audit("view", record=rec)
         return resp
 
     try:
-        return redirect(s3_service.presigned_url(key, inline=True))
+        url = s3_service.presigned_url(key, inline=True)
+        _audit("view", record=rec)
+        return redirect(url)
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
 
@@ -332,32 +423,84 @@ def api_download_bulk():
     access = _current_access()
     if not access["can_download"]:
         return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
-    data = request.get_json(silent=True) or {}
-    keys = data.get("keys") or []
-    keys = [k for k in keys if isinstance(k, str)
-            and s3_service.key_allowed(k, access["departments"], access["hosts"])]
+    data = request.get_json(silent=True)
+    if request.is_json and not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    if data is None:
+        data = {}
+    submitted_keys = data.get("keys") or []
+    records = []
+    seen_keys = set()
+    if isinstance(submitted_keys, list):
+        for key in submitted_keys:
+            if not isinstance(key, str) or key in seen_keys:
+                continue
+            rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
+            if rec is not None:
+                seen_keys.add(rec["key"])
+                records.append(rec)
+    keys = [rec["key"] for rec in records]
     if not keys:
         return jsonify({"error": "No files selected."}), 400
+    if len(records) > s3_service.BULK_ZIP_MAX_FILES:
+        return jsonify({
+            "error": f"A ZIP can contain at most {s3_service.BULK_ZIP_MAX_FILES} files."
+        }), 413
+    total_bytes = sum(int(rec.get("size") or 0) for rec in records)
+    if total_bytes > s3_service.BULK_ZIP_MAX_BYTES:
+        limit_gb = s3_service.BULK_ZIP_MAX_BYTES / (1024 ** 3)
+        return jsonify({
+            "error": f"A ZIP can contain at most {limit_gb:g} GB of recordings."
+        }), 413
 
     try:
         zip_path = s3_service.build_zip(keys)
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
 
-    @after_this_request
-    def _cleanup(resp):
-        try:
-            os.unlink(zip_path)
-        except OSError:
-            pass
-        return resp
+    meeting_ids = sorted({r.get("meeting_id", "") for r in records if r.get("meeting_id")})
+    candidates = sorted({r.get("candidate", "") for r in records if r.get("candidate")})
+    hosts = sorted({r.get("host", "") for r in records if r.get("host")})
+    departments = sorted({r.get("department", "") for r in records if r.get("department")})
+    _audit(
+        "bulk_download",
+        candidate=candidates[0] if len(candidates) == 1 else ("Multiple" if candidates else ""),
+        host=hosts[0] if len(hosts) == 1 else ("Multiple" if hosts else ""),
+        meeting_id=meeting_ids[0] if len(meeting_ids) == 1 else ("Multiple" if meeting_ids else ""),
+        department=departments[0] if len(departments) == 1 else ("Multiple" if departments else ""),
+        details={
+            "file_count": len(records),
+            "total_size": total_bytes,
+            "meeting_ids": meeting_ids[:50],
+            "items": [{
+                "candidate": r.get("candidate", ""),
+                "host": r.get("host", ""),
+                "meeting_id": r.get("meeting_id", ""),
+                "recording_date": r.get("date", ""),
+                "department": r.get("department", ""),
+                "file_type": r.get("file_type", ""),
+            } for r in records[:50]],
+            "items_truncated": len(records) > 50,
+        },
+    )
 
-    return send_file(
+    response = send_file(
         zip_path,
         as_attachment=True,
         download_name="interview-recordings.zip",
         mimetype="application/zip",
     )
+
+    def _cleanup():
+        try:
+            os.unlink(zip_path)
+        except OSError:
+            pass
+
+    # Tie cleanup to the file iterable itself. This runs after the file handle is
+    # closed (including on Windows, where unlinking an open ZIP would fail).
+    response.response = ClosingIterator(response.response, [_cleanup])
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -380,7 +523,11 @@ def api_users_list():
 @app.route("/api/admin/users", methods=["POST"])
 @admin_required
 def api_users_create():
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if request.is_json and not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    if data is None:
+        data = {}
     departments = _clean_departments(data.get("departments"))
     try:
         auth.create_user(
@@ -390,6 +537,11 @@ def api_users_create():
             hosts=_clean_hosts(data.get("hosts"), departments),
             can_download=bool(data.get("can_download", False)),
         )
+        _audit("user_create", details={
+            "target_user": str(data.get("username", "")),
+            "departments": departments,
+            "can_download": bool(data.get("can_download", False)),
+        })
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
@@ -400,7 +552,11 @@ def api_users_create():
 def api_users_update(username):
     """Update an existing user's departments, host restriction and/or download
     permission."""
-    data = request.get_json(silent=True) or {}
+    data = request.get_json(silent=True)
+    if request.is_json and not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    if data is None:
+        data = {}
     departments = _clean_departments(data.get("departments")) if "departments" in data else None
     hosts = None
     if "hosts" in data:
@@ -413,6 +569,11 @@ def api_users_update(username):
     try:
         auth.update_user_access(username, departments=departments, hosts=hosts,
                                 can_download=can_download)
+        _audit("user_update", details={
+            "target_user": username,
+            "departments": departments,
+            "can_download": can_download,
+        })
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 404
@@ -421,8 +582,34 @@ def api_users_update(username):
 @app.route("/api/admin/users/<username>", methods=["DELETE"])
 @admin_required
 def api_users_delete(username):
-    auth.delete_user(username)
+    if not auth.delete_user(username):
+        return jsonify({"error": "No such user."}), 404
+    _audit("user_delete", details={"target_user": username})
     return jsonify({"ok": True})
+
+
+@app.route("/api/admin/logs", methods=["GET"])
+@admin_required
+def api_audit_logs():
+    try:
+        page = max(1, _int_arg("page", 1))
+        per_page = max(1, min(_int_arg("per_page", 50), 200))
+        response = jsonify(audit_service.list_events(
+            page=page,
+            per_page=per_page,
+            action=request.args.get("action", ""),
+            username=request.args.get("username", ""),
+            q=request.args.get("q", ""),
+            date_from=request.args.get("date_from", ""),
+            date_to=request.args.get("date_to", ""),
+        ))
+        response.headers["Cache-Control"] = "no-store"
+        return response
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception:
+        app.logger.exception("Could not read the audit log")
+        return jsonify({"error": "Could not read audit logs."}), 500
 
 
 # ─────────────────────────────────────────────────────────────────────────────

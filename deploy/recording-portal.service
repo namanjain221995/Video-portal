@@ -12,6 +12,7 @@ After=network.target
 [Service]
 Type=simple
 User=ubuntu
+UMask=0077
 WorkingDirectory=/home/ubuntu/zoom-interview-portal
 EnvironmentFile=/home/ubuntu/zoom-interview-portal/.env
 ExecStart=/home/ubuntu/zoom-interview-portal/venv/bin/gunicorn \

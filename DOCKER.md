@@ -18,7 +18,8 @@ docker compose down           # stop
 docker compose up -d --build  # apply code/.env changes
 ```
 
-Created users persist in the `portal-data` volume across rebuilds.
+Created users, the S3 index, and admin audit logs persist in the `portal-data`
+volume across rebuilds.
 
 ---
 

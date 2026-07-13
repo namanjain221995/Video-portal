@@ -20,8 +20,10 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile + import
         run: |
-          python -m py_compile app.py auth.py s3_service.py
+          python -m py_compile app.py auth.py audit_service.py s3_service.py
           DEMO_MODE=true SECRET_KEY=ci python -c "import app; print('import OK')"
+      - name: Audit log integration tests
+        run: python -W error::ResourceWarning -m unittest discover -s tests -v
 
   # 2. Deploy: pull latest on the box and rebuild the container
   deploy:

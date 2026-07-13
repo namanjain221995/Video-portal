@@ -9,6 +9,8 @@
     <div class="spacer"></div>
     <span class="who">Signed in as <strong>{{ username }}</strong></span>
     <a class="navlink" href="{{ url_for('search_page') }}">Search</a>
+    <a class="navlink" href="{{ url_for('admin_page') }}" aria-current="page">Admin</a>
+    <a class="navlink" href="{{ url_for('logs_page') }}">Logs</a>
     <a class="navlink" href="{{ url_for('logout') }}">Log out</a>
   </div>
 </header>

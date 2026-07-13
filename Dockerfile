@@ -13,9 +13,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # App code
 COPY . .
 
-# Writable data dir for users.json (mounted as a volume in compose)
+# Writable data dir for users.json + audit.db (mounted as a volume in compose)
 RUN mkdir -p /data
-ENV USERS_FILE=/data/users.json
+ENV USERS_FILE=/data/users.json \
+    AUDIT_DB=/data/audit.db
 
 EXPOSE 8000
 

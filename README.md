@@ -17,6 +17,9 @@ Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{Me
 - **Filter** by company, date (e.g. `2026-06-10` or `2026-06`), meeting ID, and file type (MP4 / M4A / TRANSCRIPT / CHAT…).
 - **Download** individual files (direct from S3 via pre-signed URLs) or **all filtered results as a zip**.
 - **Admin** accounts come from `.env`; admins create normal **users** stored (hashed) in `users.json`.
+- **Audit logs** give admins a searchable history of logins, searches, previews,
+  downloads, index refreshes, and user-management changes. Activity is stored in
+  SQLite (`audit.db`) and displayed in the browser's local timezone.
 
 ---
 
@@ -149,7 +152,8 @@ Add HTTPS (443 + a certificate, e.g. Caddy or certbot) before any public use.
 | `app.py` | Flask routes: login, search, downloads, admin API |
 | `s3_service.py` | Lists `Interview-Success/`, parses keys, caches, search/filter, pre-signed URLs, zip builder, demo data |
 | `auth.py` | Admins from `.env`, users in `users.json` (hashed) |
-| `templates/` | `login`, `search`, `admin` pages |
+| `audit_service.py` | Persistent SQLite activity log for the admin-only Logs page |
+| `templates/` | `login`, `search`, `admin`, and audit `logs` pages |
 | `static/` | CSS + JS |
 | `deploy/` | IAM policy, systemd unit, nginx config |
 
@@ -160,7 +164,9 @@ index** button.
 ### Notes / limits
 - **Bulk zip** streams each object through the app (uses EC2 bandwidth). Fine
   for a handful of files; for very large multi-GB selections prefer individual
-  downloads (those go browser→S3 directly and don't touch the server).
+  downloads (those go browser→S3 directly and don't touch the server). A ZIP is
+  limited to 250 files / 10 GiB by default; both limits are configurable through
+  `BULK_ZIP_MAX_FILES` and `BULK_ZIP_MAX_BYTES`.
 - `users.json` is a flat file — good for a team-sized tool. Swap for a DB if
   you outgrow it. Each user record carries `departments` (which top-level folders
   they may browse) and `can_download` (download vs view-only).
@@ -171,3 +177,8 @@ index** button.
   URL) and the download/zip buttons are removed. Note this is a soft control:
   inline streaming can never be made fully un-saveable by a determined user — it
   stops casual downloads, not a screen recorder or devtools.
+- Audit events are retained for 180 days by default. Set
+  `AUDIT_RETENTION_DAYS=0` to disable age-based cleanup. A video `view` event means
+  the preview was opened; direct-to-S3 playback does not prove watch duration.
+  `AUDIT_MAX_ROWS` also caps retained events (default 100,000) so the database
+  cannot grow without bound.

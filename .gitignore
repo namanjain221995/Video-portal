@@ -1,5 +1,7 @@
 .env
 users.json
+audit.db
+audit.db-*
 __pycache__/
 *.pyc
 *.zip

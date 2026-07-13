@@ -1,6 +1,8 @@
 .env
 users.json
 users.json.tmp
+audit.db
+audit.db-*
 venv/
 .venv/
 .verify_venv/
@@ -14,3 +16,4 @@ __pycache__/
 README.md
 DOCKER.md
 deploy/
+tests/
