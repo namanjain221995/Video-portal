@@ -18,10 +18,13 @@
 
   // key -> record, for the rows currently rendered
   let currentRows = new Map();
-  // set of selected keys
-  const selected = new Set();
+  // selection persists across pages of the SAME search: key -> size (bytes),
+  // so the bulk bar can total files that are no longer on the visible page.
+  const selected = new Map();
   // monotonic id so a slow/old response can never clobber a newer search
   let searchSeq = 0;
+  // current page (resets to 1 on a new query / sort / per-page change)
+  let page = 1;
 
   // Access, learned from /api/filters (and reconfirmed on every search). The
   // server enforces both for real — these only shape what the UI offers.
@@ -159,6 +162,17 @@
   // ── search ───────────────────────────────────────────────────────────────
   async function runSearch(e) {
     if (e) e.preventDefault();
+    page = 1;
+    selected.clear();          // a NEW query starts a fresh selection
+    await executeSearch();
+  }
+
+  function gotoPage(p) {
+    page = p;
+    executeSearch(true);       // paging keeps the cross-page selection
+  }
+
+  async function executeSearch(keepSelection) {
     clearNotice();
 
     const deptSel = $("f-dept");
@@ -172,6 +186,9 @@
       meeting_id: $("f-meeting").value,
       file_type: $("f-filetype").value,
       department: deptVal,
+      page: String(page),
+      per_page: $("per-page").value,
+      sort: $("sort-by").value,
     });
 
     // Empty-query guard: a blank search never hits S3 or serialises the bucket.
@@ -184,6 +201,7 @@
     if (!otherFilters && !deptIsQuery) {
       summary.innerHTML = "";
       selected.clear(); currentRows = new Map(); updateBulkBar();
+      hidePagination();
       showEmpty("Enter a candidate, company, date, meeting ID, or pick a type, then Search.");
       return;
     }
@@ -203,13 +221,21 @@
       if (!resp.ok) {
         showNotice(data.error || "Search failed.", "error");
         showEmpty("Search failed — see the message above.", "⚠️");
+        hidePagination();
         return;
       }
-      renderResults(data);
+      // Out-of-range page (e.g. per-page grew, or the index shrank) — snap back.
+      if ((data.results || []).length === 0 && data.total > 0 && page > 1) {
+        page = 1;
+        return executeSearch(keepSelection);
+      }
+      renderResults(data, keepSelection);
+      renderPagination(data);
     } catch (err) {
       if (seq !== searchSeq) return;
       showNotice("Network error during search.", "error");
       showEmpty("Could not reach the server.", "⚠️");
+      hidePagination();
     } finally {
       if (seq === searchSeq) {
         btn.disabled = false;
@@ -218,18 +244,22 @@
     }
   }
 
-  function renderResults(data) {
+  function renderResults(data, keepSelection) {
     const rows = data.results || [];
     // The server is the source of truth for permission on every response.
     if (typeof data.can_download === "boolean") canDownload = data.can_download;
-    selected.clear();
+    if (!keepSelection) selected.clear();
     currentRows = new Map(rows.map((r) => [r.key, r]));
     updateBulkBar();
 
     const total = data.total != null ? data.total : data.count;
+    const cur = data.page || 1;
+    const per = data.per_page || rows.length || 1;
+    const start = total === 0 ? 0 : (cur - 1) * per + 1;
+    const end = total === 0 ? 0 : start + rows.length - 1;
     summary.innerHTML =
-      `<strong>${total}</strong> file${total === 1 ? "" : "s"} · ${fmtSize(data.total_size)} total` +
-      (data.truncated ? ` <span class="trunc-note">(showing first ${data.count})</span>` : "") +
+      `<strong>${total.toLocaleString()}</strong> file${total === 1 ? "" : "s"} · ${fmtSize(data.total_size)} total` +
+      (total > rows.length ? ` <span class="trunc-note">showing ${start.toLocaleString()}–${end.toLocaleString()}</span>` : "") +
       (canDownload ? "" : ` <span class="badge badge-muted">View-only</span>`);
 
     if (rows.length === 0) {
@@ -241,7 +271,7 @@
       const cat = r.category || "other";
       const dl = "/api/download?key=" + encodeURIComponent(r.key);
       const checkCell = canDownload
-        ? `<td class="col-check"><input type="checkbox" class="row-check" aria-label="Select"></td>` : "";
+        ? `<td class="col-check"><input type="checkbox" class="row-check"${selected.has(r.key) ? " checked" : ""} aria-label="Select"></td>` : "";
       const actionCell = `<td class="col-actions">` +
         `<button class="btn btn-ghost btn-sm view-btn" type="button" title="View in browser">▶ View</button>` +
         (canDownload ? ` <a class="btn btn-ghost btn-sm" href="${dl}" title="Download">⬇</a>` : "") +
@@ -296,15 +326,27 @@
         cb.addEventListener("change", onRowToggle);
       });
       const all = $("check-all");
-      if (all) all.addEventListener("change", onCheckAll);
+      if (all) {
+        all.addEventListener("change", onCheckAll);
+        all.checked = pageFullySelected();
+      }
     }
+  }
+
+  function pageFullySelected() {
+    if (currentRows.size === 0) return false;
+    let allIn = true;
+    currentRows.forEach((r, k) => { if (!selected.has(k)) allIn = false; });
+    return allIn;
   }
 
   function onRowToggle(e) {
     const key = e.target.closest("tr").dataset.key;
-    if (e.target.checked) selected.add(key); else selected.delete(key);
+    const r = currentRows.get(key);
+    if (e.target.checked) selected.set(key, r ? Number(r.size) || 0 : 0);
+    else selected.delete(key);
     const all = $("check-all");
-    if (all) all.checked = selected.size === currentRows.size && currentRows.size > 0;
+    if (all) all.checked = pageFullySelected();
     updateBulkBar();
   }
 
@@ -313,7 +355,9 @@
     resultsArea.querySelectorAll("tr[data-key]").forEach((tr) => {
       const cb = tr.querySelector(".row-check");
       cb.checked = on;
-      if (on) selected.add(tr.dataset.key); else selected.delete(tr.dataset.key);
+      const r = currentRows.get(tr.dataset.key);
+      if (on) selected.set(tr.dataset.key, r ? Number(r.size) || 0 : 0);
+      else selected.delete(tr.dataset.key);
     });
     updateBulkBar();
   }
@@ -323,7 +367,7 @@
     bulkBar.style.display = "flex";
     bulkCount.textContent = `${selected.size} selected`;
     let total = 0;
-    selected.forEach((k) => { const r = currentRows.get(k); if (r) total += Number(r.size) || 0; });
+    selected.forEach((size) => { total += size; });   // sizes cached at select time
     bulkSize.textContent = fmtSize(total);
   }
 
@@ -338,7 +382,7 @@
       const resp = await fetch("/api/download/bulk", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keys: Array.from(selected) }),
+        body: JSON.stringify({ keys: Array.from(selected.keys()) }),
       });
       if (resp.status === 401) { location.href = "/login"; return; }
       if (!resp.ok) {
@@ -393,12 +437,59 @@
     const deptSel = $("f-dept");
     if (deptSel && !deptSel.disabled) deptSel.value = "";
     refreshHostOptions();   // department reset -> Host back to the full union
+    page = 1;
     selected.clear();
     currentRows = new Map();
     summary.innerHTML = "";
     clearNotice();
     updateBulkBar();
+    hidePagination();
     showEmpty("Run a search to see recordings.");
+  }
+
+  // ── pagination bar ───────────────────────────────────────────────────────
+  function hidePagination() {
+    const el = $("pagination");
+    el.style.display = "none";
+    el.innerHTML = "";
+  }
+
+  function renderPagination(data) {
+    const el = $("pagination");
+    const pages = data.pages || 1;
+    const cur = data.page || 1;
+    if (!data.total || pages <= 1) { hidePagination(); return; }
+
+    const btn = (p, label, disabled, active) =>
+      `<button type="button" class="btn btn-ghost btn-sm page-btn${active ? " active" : ""}"` +
+      ` data-page="${p}"${disabled ? " disabled" : ""}>${label}</button>`;
+
+    // Window of page numbers: 1, 2 … cur±2 … last-1, last (deduped, in order).
+    const win = [];
+    const add = (p) => { if (p >= 1 && p <= pages && win.indexOf(p) === -1) win.push(p); };
+    add(1); add(2);
+    for (let p = cur - 2; p <= cur + 2; p++) add(p);
+    add(pages - 1); add(pages);
+    win.sort((a, b) => a - b);
+
+    const parts = [btn(cur - 1, "‹ Prev", cur <= 1, false)];
+    let prev = 0;
+    win.forEach((p) => {
+      if (p - prev > 1) parts.push('<span class="page-ellipsis">…</span>');
+      parts.push(btn(p, String(p), false, p === cur));
+      prev = p;
+    });
+    parts.push(btn(cur + 1, "Next ›", cur >= pages, false));
+    parts.push(`<span class="page-info">Page ${cur.toLocaleString()} of ${pages.toLocaleString()}</span>`);
+
+    el.innerHTML = parts.join("");
+    el.style.display = "flex";
+    el.querySelectorAll(".page-btn").forEach((b) => {
+      b.addEventListener("click", () => {
+        const p = parseInt(b.dataset.page, 10);
+        if (p >= 1 && p <= pages && p !== cur) gotoPage(p);
+      });
+    });
   }
 
   // ── preview (view-in-browser, no download) ─────────────────────────────────
@@ -463,6 +554,9 @@
   // ── wire up ──────────────────────────────────────────────────────────────
   $("search-form").addEventListener("submit", runSearch);
   $("f-dept").addEventListener("change", refreshHostOptions);
+  // Re-run from page 1 when sort/page-size changes; selection survives (same set).
+  $("sort-by").addEventListener("change", () => { page = 1; executeSearch(true); });
+  $("per-page").addEventListener("change", () => { page = 1; executeSearch(true); });
   $("btn-clear").addEventListener("click", clearFilters);
   $("btn-refresh").addEventListener("click", refreshIndex);
   $("btn-zip").addEventListener("click", downloadZip);

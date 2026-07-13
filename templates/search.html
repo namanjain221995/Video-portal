@@ -81,11 +81,33 @@
     <h2>Results</h2>
     <div class="spacer"></div>
     <span class="summary" id="summary"></span>
+    <label class="results-ctl" for="sort-by">Sort
+      <select class="input" id="sort-by">
+        <option value="">Department (A–Z)</option>
+        <option value="date_desc">Date — newest first</option>
+        <option value="date_asc">Date — oldest first</option>
+        <option value="size_desc">Size — largest first</option>
+        <option value="size_asc">Size — smallest first</option>
+        <option value="candidate">Candidate (A–Z)</option>
+      </select>
+    </label>
+    <label class="results-ctl" for="per-page">Per page
+      <select class="input" id="per-page">
+        <option value="25">25</option>
+        <option value="50">50</option>
+        <option value="100" selected>100</option>
+        <option value="250">250</option>
+        <option value="500">500</option>
+      </select>
+    </label>
   </div>
 
   <div id="results-area">
     <div class="empty"><div class="big">🔍</div>Run a search to see recordings.</div>
   </div>
+
+  <!-- Pagination -->
+  <div id="pagination" class="pagination"></div>
 
   <!-- Bulk action bar -->
   <div class="sticky-bar" id="bulk-bar" style="display:none;">

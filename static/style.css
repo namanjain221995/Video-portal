@@ -177,6 +177,13 @@ select.input { appearance: none;
 }
 .results-head h2 { margin: 0; font-size: 16px; }
 .results-head .spacer { flex: 1; }
+
+/* Sort / per-page controls (top right of the results header) */
+.results-ctl {
+  display: inline-flex; align-items: center; gap: 7px;
+  font-size: 13px; font-weight: 600; color: var(--ink-soft); white-space: nowrap;
+}
+.results-ctl select.input { width: auto; padding: 7px 30px 7px 10px; font-size: 13px; }
 .summary { font-size: 13.5px; color: var(--ink-soft); }
 .summary strong { color: var(--ink); }
 
@@ -249,6 +256,18 @@ table.results tbody tr:last-child td { border-bottom: none; }
 
 .empty { text-align: center; padding: 50px 20px; color: var(--muted); }
 .empty .big { font-size: 30px; margin-bottom: 8px; }
+
+/* Pagination bar (below the results table) */
+.pagination {
+  display: none; align-items: center; justify-content: center; gap: 6px;
+  margin-top: 14px; flex-wrap: wrap;
+}
+.pagination .page-btn { min-width: 36px; justify-content: center; }
+.pagination .page-btn.active {
+  background: var(--brand); color: #fff; border-color: var(--brand);
+}
+.page-ellipsis { color: var(--muted); padding: 0 2px; font-weight: 700; }
+.page-info { font-size: 12.5px; color: var(--muted); margin-left: 8px; }
 
 .sticky-bar {
   position: sticky; bottom: 0; margin-top: 16px;

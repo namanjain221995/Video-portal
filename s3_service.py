@@ -519,10 +519,22 @@ def filter_options(departments=None, block: bool = False):
     }
 
 
+# User-selectable sort orders. Applied as a stable re-sort on top of the default
+# (department, candidate, date…) tuple, so equal keys keep a deterministic order.
+_SORTS = {
+    "date_desc": (lambda r: r["date"], True),
+    "date_asc":  (lambda r: r["date"], False),
+    "size_desc": (lambda r: r["size"], True),
+    "size_asc":  (lambda r: r["size"], False),
+    "candidate": (lambda r: r["candidate"].lower(), False),
+}
+
+
 def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
-           department="", allowed_departments=None, limit=None):
-    """Filter the index. Returns (rows, total, total_size) where rows is capped at
-    `limit` (default RESULT_LIMIT) but total/total_size reflect the FULL match set.
+           department="", allowed_departments=None, limit=None, offset=0, sort=""):
+    """Filter the index. Returns (rows, total, total_size) where rows is the
+    `offset:offset+limit` page (limit defaults to RESULT_LIMIT) of the sorted
+    match set, while total/total_size reflect the FULL match set.
 
     `allowed_departments` is the access mask for the signed-in user: records outside
     it are dropped BEFORE any other filter, so a user can never reach a department
@@ -570,10 +582,14 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
         out.append(r)
 
     out.sort(key=lambda r: (r["department"].lower(), r["candidate"].lower(), r["date"], r["meeting_id"], r["file_type"]))
+    if sort in _SORTS:
+        keyf, rev = _SORTS[sort]
+        out.sort(key=keyf, reverse=rev)   # stable → the tuple above breaks ties
     total = len(out)
     total_size = sum(r["size"] for r in out)
     lim = RESULT_LIMIT if limit is None else limit
-    rows = out[:lim]
+    start = max(0, int(offset or 0))
+    rows = out[start:start + lim]
     if cand_toks:
         # Tell the UI WHICH attendee(s) matched in a group session. Shallow copies
         # only for the returned page — the shared cached records are never mutated.

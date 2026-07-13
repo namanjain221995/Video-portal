@@ -176,11 +176,20 @@ def api_filters():
         return jsonify({"error": _s3_err(e)}), 502
 
 
+def _int_arg(name, default):
+    try:
+        return int(request.args.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
 @app.route("/api/search")
 @login_required
 def api_search():
     try:
         access = _current_access()
+        page = max(1, _int_arg("page", 1))
+        per_page = max(1, min(_int_arg("per_page", 100), s3_service.RESULT_LIMIT))
         results, total, total_size = s3_service.search(
             candidate=request.args.get("candidate", ""),
             company=request.args.get("company", ""),
@@ -190,10 +199,16 @@ def api_search():
             host=request.args.get("host", ""),
             department=request.args.get("department", ""),
             allowed_departments=access["departments"],
+            limit=per_page,
+            offset=(page - 1) * per_page,
+            sort=request.args.get("sort", ""),
         )
         return jsonify({
             "count": len(results),
             "total": total,
+            "page": page,
+            "per_page": per_page,
+            "pages": max(1, -(-total // per_page)),   # ceil
             "truncated": total > len(results),
             "total_size": total_size,
             "can_download": access["can_download"],
