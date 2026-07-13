@@ -8,10 +8,24 @@
       "Resource": "arn:aws:s3:::zoom-automation-bucket"
     },
     {
-      "Sid": "ReadInterviewSuccessObjects",
+      "Sid": "ReadDepartmentObjects",
       "Effect": "Allow",
       "Action": "s3:GetObject",
-      "Resource": "arn:aws:s3:::zoom-automation-bucket/Interview-Success/*"
+      "Resource": [
+        "arn:aws:s3:::zoom-automation-bucket/HR/*",
+        "arn:aws:s3:::zoom-automation-bucket/Interview-Success/*",
+        "arn:aws:s3:::zoom-automation-bucket/Marketing/*",
+        "arn:aws:s3:::zoom-automation-bucket/Training/*",
+        "arn:aws:s3:::zoom-automation-bucket/Customer-Success/*",
+        "arn:aws:s3:::zoom-automation-bucket/Techsphere/*",
+        "arn:aws:s3:::zoom-automation-bucket/Executive-Assistant/*",
+        "arn:aws:s3:::zoom-automation-bucket/QMS/*",
+        "arn:aws:s3:::zoom-automation-bucket/Other/*",
+        "arn:aws:s3:::zoom-automation-bucket/CEO/*",
+        "arn:aws:s3:::zoom-automation-bucket/COO/*",
+        "arn:aws:s3:::zoom-automation-bucket/Business-Development/*",
+        "arn:aws:s3:::zoom-automation-bucket/Advanced-Training/*"
+      ]
     }
   ]
 }

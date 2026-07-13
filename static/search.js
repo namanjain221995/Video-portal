@@ -46,6 +46,21 @@
     ));
   }
 
+  // Candidate cell: group sessions (e.g. Advanced-Training) carry every attendee
+  // in r.candidates. Show the attendee(s) that matched the search — or the first
+  // two — plus a "+N more" chip whose tooltip lists the full roster, instead of
+  // the raw hyphen-joined folder blob.
+  function candidateCell(r) {
+    const cands = (r.candidates && r.candidates.length) ? r.candidates : [r.candidate];
+    if (cands.length === 1) return esc(cands[0]);
+    const matched = (r.matched_candidates || []).filter((c) => cands.indexOf(c) !== -1);
+    const shown = matched.length ? matched : cands.slice(0, 2);
+    const extra = cands.length - shown.length;
+    const roster = "Attendees (" + cands.length + "): " + cands.join(", ");
+    return `<span title="${esc(roster)}">${shown.map(esc).join(", ")}</span>` +
+      (extra > 0 ? ` <span class="group-more" title="${esc(roster)}">👥 +${extra} more</span>` : "");
+  }
+
   function showNotice(msg, kind) {
     notice.textContent = msg;
     notice.className = "notice show " + (kind === "ok" ? "notice-ok" : "notice-error");
@@ -220,7 +235,8 @@
       return `<tr data-key="${esc(r.key)}">
         ${checkCell}
         <td>${esc(r.department)}</td>
-        <td class="candidate">${esc(r.candidate)}</td>
+        <td>${esc(r.host)}</td>
+        <td class="candidate">${candidateCell(r)}</td>
         <td>${esc(r.company)}</td>
         <td>${esc(r.date)}</td>
         <td>${esc(r.round)}</td>
@@ -241,7 +257,7 @@
           <thead>
             <tr>
               ${checkHead}
-              <th>Department</th><th>Candidate</th><th>Company</th><th>Date</th><th>Round</th>
+              <th>Department</th><th>Host</th><th>Candidate</th><th>Company</th><th>Date</th><th>Round</th>
               <th>Meeting ID</th><th>Type</th><th>File</th><th>Size</th><th></th>
             </tr>
           </thead>

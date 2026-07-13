@@ -10,7 +10,10 @@ It reads the exact path layout your Lambda writes:
 Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{MeetingID}/{FileType}/{file}
 ```
 
-- **Search** by candidate name (typo/underscore tolerant).
+- **Search** by candidate name (typo/underscore tolerant). Group sessions
+  (e.g. `Advanced-Training`, where every attendee is hyphen-joined into one
+  candidate folder) are searched **per attendee** — searching one person finds
+  the meeting and the results show who matched plus a "+N more" roster.
 - **Filter** by company, date (e.g. `2026-06-10` or `2026-06`), meeting ID, and file type (MP4 / M4A / TRANSCRIPT / CHAT…).
 - **Download** individual files (direct from S3 via pre-signed URLs) or **all filtered results as a zip**.
 - **Admin** accounts come from `.env`; admins create normal **users** stored (hashed) in `users.json`.
@@ -76,8 +79,9 @@ server** — attach an IAM role to the EC2 instance instead.
 
 ### a) Create the IAM policy
 IAM → Policies → Create policy → JSON → paste `deploy/iam-policy.json`
-(it allows `ListBucket` on the bucket + `GetObject` on `Interview-Success/*`
-only). Name it `recording-portal-s3-read`.
+(it allows `ListBucket` on the bucket + `GetObject` on **every department
+folder in `DEPARTMENTS`** — if you add a department, add its prefix to the
+policy too). Name it `recording-portal-s3-read`.
 
 ### b) Attach it to the EC2 instance via a role
 - IAM → Roles → Create role → trusted entity **AWS service → EC2** → attach
@@ -91,9 +95,10 @@ boto3 picks up the role automatically — no keys in `.env`.
 Set `AWS_REGION=us-east-1` in `.env` (your bucket is in N. Virginia). This
 matters for pre-signed URL signatures.
 
-> Pre-signed URLs and the bulk-zip both work with just `GetObject` on
-> `Interview-Success/*`. No S3 CORS config is needed — individual downloads
-> redirect the browser straight to S3, and zips are streamed through the app.
+> Pre-signed URLs and the bulk-zip need `GetObject` on **each department
+> prefix the portal serves** (see `deploy/iam-policy.json`). No S3 CORS config
+> is needed — individual downloads redirect the browser straight to S3, and
+> zips are streamed through the app.
 
 ---
 

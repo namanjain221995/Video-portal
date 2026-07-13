@@ -54,7 +54,8 @@ REGION       = os.environ.get("AWS_REGION", "us-east-1")
 # user by an admin. Override via DEPARTMENTS="HR,Marketing,…" in .env.
 DEPARTMENTS  = [d.strip() for d in os.environ.get(
     "DEPARTMENTS",
-    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere,Executive-Assistant",
+    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere,Executive-Assistant,"
+    "QMS,Other,CEO,COO,Business-Development,Advanced-Training",
 ).split(",") if d.strip()]
 CACHE_TTL    = int(os.environ.get("CACHE_TTL_SEC", "300"))
 URL_EXPIRY   = int(os.environ.get("PRESIGNED_URL_EXPIRY_SEC", "3600"))
@@ -147,6 +148,32 @@ _TIME_RE = re.compile(r"^time-.*ist$", re.I)
 def _is_time(s: str) -> bool:
     return bool(_TIME_RE.match(s or ""))
 
+# Group sessions (e.g. Advanced-Training) put EVERY attendee in the candidate
+# folder, hyphen-joined, often behind a numeric id prefix:
+#     700758249_Shafahad_Mohammed-Abdu_Raziq-Nandini_K-Ram_Reddy-…
+# Underscores stay INSIDE a person's name; hyphens separate people. A leading
+# "digits(-digits)*_" chunk (meeting/employee id) is stripped before splitting.
+_ID_PREFIX_RE = re.compile(r"^\d[\d\-]*_")
+_HAS_LETTER_RE = re.compile(r"[A-Za-z]")
+
+
+def _split_candidates(candidate: str) -> list:
+    """The individual people inside a candidate folder name. A normal 1-person
+    folder yields a single cleaned name; a hyphen-joined group yields one entry
+    per attendee (deduped, order kept). Falls back to the raw string when the
+    folder holds no recognisable name at all."""
+    base = _ID_PREFIX_RE.sub("", (candidate or "").strip())
+    seen, out = set(), []
+    for part in base.split("-"):
+        part = part.strip("_ ")
+        if not part or not _HAS_LETTER_RE.search(part):
+            continue  # empty / leftover pure-numeric id fragment
+        k = part.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(part)
+    return out or [candidate]
+
 # Low-cardinality fields are interned so the 50k records don't hold 50k copies of
 # the same ~21 hosts / ~8 file-types / handful of dates — a big per-worker RAM win.
 _INTERN_FIELDS = ("department", "host", "year", "month", "company", "date", "round",
@@ -158,6 +185,11 @@ def _intern_rec(d: dict) -> dict:
         v = d.get(k)
         if isinstance(v, str):
             d[k] = sys.intern(v)
+    # Attendee names repeat across the ~10 files of the same meeting — intern them
+    # too so a group session doesn't hold N copies of every name per file.
+    cands = d.get("candidates")
+    if isinstance(cands, list):
+        d["candidates"] = [sys.intern(c) for c in cands if isinstance(c, str)]
     return d
 
 
@@ -207,6 +239,7 @@ def _parse_key(key: str, size):
         "year":       year,
         "month":      month,
         "candidate":  candidate,
+        "candidates": _split_candidates(candidate),   # people in the meeting (1+)
         "company":    company,
         "date":       date,
         "round":      rnd,
@@ -409,14 +442,30 @@ def _records_by_key():
 # ─────────────────────────────────────────────────────────────────────────────
 # Search + filters
 # ─────────────────────────────────────────────────────────────────────────────
-def _match_candidate(query: str, candidate: str) -> bool:
-    """Token match that ignores underscores/case so 'sirikonda' or
-    'akhilendra sirikonda' both match 'Akhilendra_NA_Sirikonda'."""
-    q = (query or "").lower().replace("_", " ").strip()
-    if not q:
+def _cand_tokens(query: str) -> list:
+    """Normalised candidate-search tokens: lowercase, underscores/hyphens read
+    as spaces, so 'sirikonda' or 'akhilendra sirikonda' both hit
+    'Akhilendra_NA_Sirikonda'."""
+    return (query or "").lower().replace("_", " ").replace("-", " ").split()
+
+
+def _name_matches(toks, name: str) -> bool:
+    n = (name or "").lower().replace("_", " ").replace("-", " ")
+    return all(t in n for t in toks)
+
+
+def _match_candidate(toks, rec: dict) -> bool:
+    """True when the query names someone in this recording. In a group session
+    (several attendees in one candidate folder) EVERY token must land inside ONE
+    attendee's name — so 'mohammed reddy' can't match a meeting where Mohammed
+    and Reddy are different people. Single-candidate records keep the old
+    whole-string behaviour (an id prefix like '152026_' stays searchable)."""
+    if not toks:
         return True
-    c = candidate.lower().replace("_", " ")
-    return all(tok in c for tok in q.split())
+    cands = rec.get("candidates") or [rec["candidate"]]
+    if len(cands) > 1:
+        return any(_name_matches(toks, c) for c in cands)
+    return _name_matches(toks, rec["candidate"])
 
 
 def filter_options(departments=None, block: bool = False):
@@ -480,6 +529,7 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
         return [], 0, 0
 
     allowed = set(allowed_departments) if allowed_departments is not None else None
+    cand_toks = _cand_tokens(candidate)
     recs = get_records()
     out = []
     for r in recs:
@@ -487,7 +537,7 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
             continue
         if department and department != r["department"]:
             continue
-        if not _match_candidate(candidate, r["candidate"]):
+        if not _match_candidate(cand_toks, r):
             continue
         if company and company not in r["company"].lower():     # substring, free-text
             continue
@@ -505,7 +555,16 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     total = len(out)
     total_size = sum(r["size"] for r in out)
     lim = RESULT_LIMIT if limit is None else limit
-    return out[:lim], total, total_size
+    rows = out[:lim]
+    if cand_toks:
+        # Tell the UI WHICH attendee(s) matched in a group session. Shallow copies
+        # only for the returned page — the shared cached records are never mutated.
+        rows = [
+            dict(r, matched_candidates=[c for c in r["candidates"] if _name_matches(cand_toks, c)])
+            if len(r.get("candidates") or []) > 1 else r
+            for r in rows
+        ]
+    return rows, total, total_size
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -594,8 +653,12 @@ def presigned_url(key: str, inline: bool = False) -> str:
 
 
 def _flat_name(rec: dict) -> str:
-    """Readable, unique name for a file inside the bulk zip."""
-    base = f"{rec['candidate']}__{rec['company']}__{rec['date']}__{rec['round']}__{rec['meeting_id']}__{rec['file_type']}__{rec['filename']}"
+    """Readable, unique name for a file inside the bulk zip. Group sessions use
+    the first attendee + a count instead of the full hyphen-joined roster, which
+    would otherwise blow past Windows' 255-char extraction limit."""
+    cands = rec.get("candidates") or [rec["candidate"]]
+    cand = cands[0] if len(cands) == 1 else f"{cands[0]}_and_{len(cands) - 1}_more"
+    base = f"{cand}__{rec['company']}__{rec['date']}__{rec['round']}__{rec['meeting_id']}__{rec['file_type']}__{rec['filename']}"
     return base.replace("/", "_")
 
 
@@ -671,6 +734,32 @@ DEMO_RECORDS += _mk("Training", "Ishita_Aggarwal", "Dharani_Katta", "Microsoft",
                     [("MP4", "rec_96355121888.mp4", 167_000_000),
                      ("M4A", "audio_96355121888.m4a", 11_200_000),
                      ("TRANSCRIPT", "transcript_96355121888.vtt", 65_400)])
+
+
+def _mk_c(dept, host, cand, date, time_folder, mid, files):
+    """Layout C keys ({Dept}/{Host}/{Y}/{M}/{Candidate}/{Date}/{Time-*-IST}/{MeetingID}/{FileType}/{file})
+    — the shape HR/QMS/Advanced-Training/… write (no Company/Round folders)."""
+    out = []
+    for ft, fname, size in files:
+        key = f"{dept}/{host}/2026/June/{cand}/{date}/{time_folder}/{mid}/{ft}/{fname}"
+        rec = _parse_key(key, size)
+        if rec:
+            out.append(rec)
+    return out
+
+
+# A group training session: every attendee lives in ONE candidate folder,
+# hyphen-joined behind a numeric id — exactly how Advanced-Training uploads look.
+DEMO_RECORDS += _mk_c("Advanced-Training", "Rahul_Verma",
+                      "700758249_Shafahad_Mohammed-Abdu_Raziq-Arbaazuddin_Mohammed-"
+                      "gangadhar_dandu-Mohammed_Monis_Khan-Nandini_K-Ram_Reddy-Syed_Faraaz-Venkata_Jagan_Mohan",
+                      "2026-06-22", "Time-8-30-PM-IST", "700758249",
+                      [("MP4", "rec_700758249.mp4", 402_000_000),
+                       ("TRANSCRIPT", "transcript_700758249.vtt", 118_000)])
+DEMO_RECORDS += _mk_c("QMS", "Priya_Nair", "Rohan_Mehta",
+                      "2026-06-21", "Time-4-00-PM-IST", "96355125555",
+                      [("MP4", "rec_96355125555.mp4", 150_000_000),
+                       ("M4A", "audio_96355125555.m4a", 10_300_000)])
 
 
 def _demo_bytes(rec: dict) -> bytes:
