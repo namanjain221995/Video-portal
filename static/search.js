@@ -48,17 +48,31 @@
 
   // Candidate cell: group sessions (e.g. Advanced-Training) carry every attendee
   // in r.candidates. Show the attendee(s) that matched the search — or the first
-  // two — plus a "+N more" chip whose tooltip lists the full roster, instead of
-  // the raw hyphen-joined folder blob.
+  // two — plus a clickable "👥" chip that opens the full who-joined list.
   function candidateCell(r) {
     const cands = (r.candidates && r.candidates.length) ? r.candidates : [r.candidate];
     if (cands.length === 1) return esc(cands[0]);
     const matched = (r.matched_candidates || []).filter((c) => cands.indexOf(c) !== -1);
     const shown = matched.length ? matched : cands.slice(0, 2);
     const extra = cands.length - shown.length;
-    const roster = "Attendees (" + cands.length + "): " + cands.join(", ");
-    return `<span title="${esc(roster)}">${shown.map(esc).join(", ")}</span>` +
-      (extra > 0 ? ` <span class="group-more" title="${esc(roster)}">👥 +${extra} more</span>` : "");
+    const label = extra > 0 ? `+${extra} more` : `${cands.length} joined`;
+    return `<span>${shown.map(esc).join(", ")}</span> ` +
+      `<button type="button" class="group-more" title="Show all ${cands.length} attendees">👥 ${esc(label)}</button>`;
+  }
+
+  // Attendee popup: click the 👥 chip to see everyone who joined the session
+  // (reuses the preview modal — close button / backdrop / Esc already wired).
+  function openAttendees(rec) {
+    if (!rec) return;
+    const cands = (rec.candidates && rec.candidates.length) ? rec.candidates : [rec.candidate];
+    const matched = new Set(rec.matched_candidates || []);
+    previewTitle.textContent =
+      `${cands.length} attendees joined` + (rec.meeting_id ? ` · Meeting ${rec.meeting_id}` : "");
+    previewBody.innerHTML = `<ol class="attendee-list">` + cands.map((c) =>
+      `<li${matched.has(c) ? ' class="matched"' : ""}>${esc(c)}` +
+      (matched.has(c) ? ' <span class="attendee-hit">matched your search</span>' : "") +
+      `</li>`).join("") + `</ol>`;
+    previewModal.style.display = "flex";
   }
 
   function showNotice(msg, kind) {
@@ -269,6 +283,12 @@
       btn.addEventListener("click", () => {
         const key = btn.closest("tr").dataset.key;
         openPreview(currentRows.get(key));
+      });
+    });
+    resultsArea.querySelectorAll(".group-more").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const key = btn.closest("tr").dataset.key;
+        openAttendees(currentRows.get(key));
       });
     });
     if (canDownload) {

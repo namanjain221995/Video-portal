@@ -186,10 +186,13 @@ def _intern_rec(d: dict) -> dict:
         if isinstance(v, str):
             d[k] = sys.intern(v)
     # Attendee names repeat across the ~10 files of the same meeting — intern them
-    # too so a group session doesn't hold N copies of every name per file.
+    # too so a group session doesn't hold N copies of every name per file. Records
+    # loaded from a pre-upgrade disk index have no "candidates" yet — backfill it
+    # here (every record, parsed or disk-loaded, passes through this function).
     cands = d.get("candidates")
-    if isinstance(cands, list):
-        d["candidates"] = [sys.intern(c) for c in cands if isinstance(c, str)]
+    if not isinstance(cands, list):
+        cands = _split_candidates(d.get("candidate", ""))
+    d["candidates"] = [sys.intern(c) for c in cands if isinstance(c, str)]
     return d
 
 
@@ -271,9 +274,15 @@ def _scan_s3():
     return records
 
 
+# Bump whenever the record shape or DEPARTMENTS coverage changes: a persisted
+# index with an older schema is rejected, forcing ONE clean re-scan on the first
+# boot after a deploy instead of serving pre-upgrade records for up to INDEX_TTL.
+INDEX_SCHEMA = 2
+
+
 def _load_disk_index(max_age):
-    """Return the parsed index from INDEX_FILE if it exists and is younger than
-    max_age seconds, else None."""
+    """Return the parsed index from INDEX_FILE if it exists, is younger than
+    max_age seconds and matches the current schema, else None."""
     if not INDEX_FILE or not os.path.exists(INDEX_FILE):
         return None
     try:
@@ -281,6 +290,8 @@ def _load_disk_index(max_age):
             return None
         with open(INDEX_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
+        if data.get("schema") != INDEX_SCHEMA:
+            return None  # pre-upgrade index — rebuild from S3
         records = data.get("records")
         if not isinstance(records, list) or not records:
             return None
@@ -369,7 +380,7 @@ def _save_disk_index(records):
     try:
         tmp = INDEX_FILE + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"records": records, "ts": time.time()}, f)
+            json.dump({"schema": INDEX_SCHEMA, "records": records, "ts": time.time()}, f)
         os.replace(tmp, INDEX_FILE)
     except OSError:
         pass  # disk cache is an optimisation; never fatal
@@ -458,13 +469,17 @@ def _match_candidate(toks, rec: dict) -> bool:
     """True when the query names someone in this recording. In a group session
     (several attendees in one candidate folder) EVERY token must land inside ONE
     attendee's name — so 'mohammed reddy' can't match a meeting where Mohammed
-    and Reddy are different people. Single-candidate records keep the old
-    whole-string behaviour (an id prefix like '152026_' stays searchable)."""
+    and Reddy are different people. A query carrying a number (a pasted id like
+    '700758249') falls back to the raw folder name, whose numeric prefix is not
+    an attendee. Single-candidate records keep the old whole-string behaviour
+    (an id prefix like '152026_' stays searchable)."""
     if not toks:
         return True
     cands = rec.get("candidates") or [rec["candidate"]]
     if len(cands) > 1:
-        return any(_name_matches(toks, c) for c in cands)
+        if any(_name_matches(toks, c) for c in cands):
+            return True
+        return any(t.isdigit() for t in toks) and _name_matches(toks, rec["candidate"])
     return _name_matches(toks, rec["candidate"])
 
 
@@ -524,12 +539,15 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     file_type  = (file_type or "").strip().lower()   # a category key (video/audio/…)
     host       = (host or "").strip().lower()
     department = (department or "").strip()
+    # Tokenise up front: separator-only input ('-', '_') yields no tokens and must
+    # count as NO query, or it would slip past the blank-submit guard and dump the
+    # caller's whole allowed corpus.
+    cand_toks = _cand_tokens(candidate)
 
-    if not any([candidate, company, date, meeting_id, file_type, host, department]):
+    if not any([cand_toks, company, date, meeting_id, file_type, host, department]):
         return [], 0, 0
 
     allowed = set(allowed_departments) if allowed_departments is not None else None
-    cand_toks = _cand_tokens(candidate)
     recs = get_records()
     out = []
     for r in recs:
