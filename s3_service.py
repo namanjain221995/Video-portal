@@ -483,13 +483,24 @@ def _match_candidate(toks, rec: dict) -> bool:
     return _name_matches(toks, rec["candidate"])
 
 
-def filter_options(departments=None, block: bool = False):
+def _host_allowed(rec, allowed_hosts) -> bool:
+    """Per-department host mask: {dept: [host, …]}. A department with no entry
+    (or an empty list) is unrestricted; otherwise the record's host must be in
+    the granted list."""
+    if not allowed_hosts:
+        return True
+    hs = allowed_hosts.get(rec["department"])
+    return not hs or rec["host"] in hs
+
+
+def filter_options(departments=None, allowed_hosts=None, block: bool = False):
     """Values for the server-side dropdowns (hosts + departments). Non-blocking by
     default: returns whatever is already cached so a page load never triggers a
     ~27s S3 scan. Pass block=True to force the index to be built first.
 
     When `departments` is given (a user's allowed set), hosts are scoped to those
-    departments so a user never sees host names from departments they can't access."""
+    departments so a user never sees host names from departments they can't access.
+    `allowed_hosts` additionally hides hosts outside a per-department grant."""
     if DEMO_MODE:
         recs = DEMO_RECORDS
     else:
@@ -503,6 +514,8 @@ def filter_options(departments=None, block: bool = False):
     if departments is not None:
         allowed = set(departments)
         recs = [r for r in recs if r["department"] in allowed]
+    if allowed_hosts:
+        recs = [r for r in recs if _host_allowed(r, allowed_hosts)]
 
     # Hosts grouped per department, so the UI can narrow the Host dropdown to the
     # chosen department instead of always showing every allowed department's hosts.
@@ -531,15 +544,19 @@ _SORTS = {
 
 
 def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
-           department="", allowed_departments=None, limit=None, offset=0, sort=""):
+           department="", allowed_departments=None, allowed_hosts=None,
+           limit=None, offset=0, sort=""):
     """Filter the index. Returns (rows, total, total_size) where rows is the
     `offset:offset+limit` page (limit defaults to RESULT_LIMIT) of the sorted
     match set, while total/total_size reflect the FULL match set.
 
     `allowed_departments` is the access mask for the signed-in user: records outside
     it are dropped BEFORE any other filter, so a user can never reach a department
-    they were not granted (admins pass the full list). `department` is an optional
-    user-chosen narrowing within that allowed set.
+    they were not granted (admins pass the full list). `allowed_hosts` narrows a
+    granted department further to specific hosts ({dept: [host, …]}); both masks
+    are applied before the user's own filters, so a crafted host/department query
+    param can never widen access. `department` is an optional user-chosen
+    narrowing within that allowed set.
 
     Empty query short-circuits to ([], 0, 0) WITHOUT touching S3 — so landing the
     page (or a blank submit) never scans or serialises the whole bucket. The access
@@ -564,6 +581,8 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     out = []
     for r in recs:
         if allowed is not None and r["department"] not in allowed:   # access mask first
+            continue
+        if not _host_allowed(r, allowed_hosts):                      # host mask second
             continue
         if department and department != r["department"]:
             continue
@@ -604,23 +623,18 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
 # ─────────────────────────────────────────────────────────────────────────────
 # Downloads
 # ─────────────────────────────────────────────────────────────────────────────
-def _key_exists(key: str) -> bool:
-    return key in _records_by_key()
-
-
-def department_of(key: str) -> str:
-    """The top-level department folder a key belongs to ('' for a malformed key)."""
-    return key.split("/", 1)[0] if key else ""
-
-
-def key_allowed(key: str, allowed_departments) -> bool:
-    """Server-side gate for download/view: the key must exist in the index AND sit
-    in a department the caller was granted. Never trust a key from the client alone."""
+def key_allowed(key: str, allowed_departments, allowed_hosts=None) -> bool:
+    """Server-side gate for download/view: the key must exist in the index, sit in
+    a department the caller was granted AND (when a host restriction applies) be
+    hosted by one of their granted hosts. Never trust a key from the client alone."""
     if not key:
         return False
-    if department_of(key) not in (allowed_departments or []):
+    rec = _records_by_key().get(key)
+    if rec is None:
         return False
-    return _key_exists(key)
+    if rec["department"] not in (allowed_departments or []):
+        return False
+    return _host_allowed(rec, allowed_hosts)
 
 
 # Mime types we want the browser to render/play inline (the rest fall back to

@@ -69,6 +69,7 @@ def list_users() -> list:
           "created_at": d.get("created_at"),
           "created_by": d.get("created_by"),
           "departments": d.get("departments", list(LEGACY_DEFAULT_DEPTS)),
+          "hosts": d.get("hosts") or {},
           "can_download": bool(d.get("can_download", True))}
          for u, d in users.items()),
         key=lambda x: x["username"].lower(),
@@ -76,18 +77,22 @@ def list_users() -> list:
 
 
 def user_access(username: str) -> dict:
-    """The access a normal user was granted: which departments they may browse and
-    whether they may download (vs view-only). Missing fields fall back to the
-    legacy defaults so pre-existing accounts keep working unchanged."""
+    """The access a normal user was granted: which departments they may browse,
+    an optional per-department host restriction ({dept: [host, …]} — a missing or
+    empty entry means EVERY host in that department), and whether they may
+    download (vs view-only). Missing fields fall back to the legacy defaults so
+    pre-existing accounts keep working unchanged."""
     rec = _load_users().get((username or "").strip()) or {}
     depts = rec.get("departments")
     if depts is None:
         depts = list(LEGACY_DEFAULT_DEPTS)
-    return {"departments": list(depts), "can_download": bool(rec.get("can_download", True))}
+    return {"departments": list(depts),
+            "hosts": dict(rec.get("hosts") or {}),
+            "can_download": bool(rec.get("can_download", True))}
 
 
 def create_user(username: str, password: str, created_by: str = "",
-                departments=None, can_download: bool = True) -> None:
+                departments=None, hosts=None, can_download: bool = True) -> None:
     username = (username or "").strip()
     if not username or not password:
         raise ValueError("Username and password are both required.")
@@ -104,14 +109,16 @@ def create_user(username: str, password: str, created_by: str = "",
             "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
             "created_by": created_by,
             "departments": list(departments or []),
+            "hosts": dict(hosts or {}),
             "can_download": bool(can_download),
         }
         _save_users(users)
 
 
-def update_user_access(username: str, departments=None, can_download=None) -> None:
-    """Change an existing user's department grant and/or download permission.
-    Pass None for a field to leave it unchanged."""
+def update_user_access(username: str, departments=None, hosts=None, can_download=None) -> None:
+    """Change an existing user's department grant, per-department host
+    restriction and/or download permission. Pass None for a field to leave it
+    unchanged. Host entries for departments the user no longer has are pruned."""
     username = (username or "").strip()
     with _lock:
         users = _load_users()
@@ -120,6 +127,11 @@ def update_user_access(username: str, departments=None, can_download=None) -> No
             raise ValueError("No such user.")
         if departments is not None:
             rec["departments"] = list(departments)
+        if hosts is not None:
+            rec["hosts"] = dict(hosts)
+        granted = set(rec.get("departments") or [])
+        rec["hosts"] = {d: h for d, h in (rec.get("hosts") or {}).items()
+                        if d in granted and h}
         if can_download is not None:
             rec["can_download"] = bool(can_download)
         _save_users(users)

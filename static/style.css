@@ -313,6 +313,20 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 .dept-check input { width: 15px; height: 15px; accent-color: var(--brand); cursor: pointer; margin: 0; }
 .dept-check input:checked + span { color: var(--brand-dk); }
 
+/* ── Per-department host restriction boxes (admin) ──────────────────────────*/
+.host-restrict { display: flex; flex-direction: column; gap: 8px; }
+.host-box {
+  border: 1px solid var(--line); border-radius: 10px;
+  padding: 9px 13px; background: #f8fafc;
+}
+.host-box summary {
+  cursor: pointer; font-size: 13px; font-weight: 600; color: var(--ink-soft);
+  user-select: none;
+}
+.host-box .host-sum { color: var(--brand-dk); font-weight: 700; }
+.host-box .host-hint { margin: 8px 0 0; }
+.host-box .host-list { margin-top: 8px; }
+
 /* ── Per-user access editor ──────────────────────────────────────────────────*/
 .user-row { border-bottom: 1px solid var(--line); padding: 14px 0; }
 .user-row:last-child { border-bottom: none; }

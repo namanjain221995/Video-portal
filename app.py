@@ -73,16 +73,18 @@ def admin_required(fn):
 # Access control (authoritative — derived from the session, never the client)
 # ─────────────────────────────────────────────────────────────────────────────
 def _current_access():
-    """What the signed-in user may reach: the list of departments they can browse
-    and whether they may download (vs view-only). Admins get every department and
-    full download rights."""
+    """What the signed-in user may reach: the list of departments they can browse,
+    an optional per-department host restriction ({dept: [host, …]} — no entry
+    means every host in that department) and whether they may download (vs
+    view-only). Admins get every department, every host and full download rights."""
     if session.get("role") == "admin":
-        return {"departments": list(s3_service.DEPARTMENTS), "can_download": True}
+        return {"departments": list(s3_service.DEPARTMENTS), "hosts": {}, "can_download": True}
     info = auth.user_access(session.get("user", ""))
     # Intersect with the departments that actually exist, so a stale grant can't
     # widen access if a department is renamed/removed in config.
     depts = [d for d in info["departments"] if d in s3_service.DEPARTMENTS]
-    return {"departments": depts, "can_download": bool(info["can_download"])}
+    hosts = {d: hs for d, hs in (info.get("hosts") or {}).items() if d in depts and hs}
+    return {"departments": depts, "hosts": hosts, "can_download": bool(info["can_download"])}
 
 
 def _clean_departments(raw):
@@ -96,6 +98,29 @@ def _clean_departments(raw):
         if d in valid and d not in seen:
             seen.add(d)
             out.append(d)
+    return out
+
+
+def _clean_hosts(raw, departments):
+    """Sanitise an admin-supplied {department: [host, …]} restriction map: keep
+    entries only for departments actually granted, with unique non-empty host
+    strings. A department with no (or an empty) entry means ALL its hosts."""
+    if not isinstance(raw, dict):
+        return {}
+    granted = set(departments or [])
+    out = {}
+    for dept, hosts in raw.items():
+        if dept not in granted or not isinstance(hosts, list):
+            continue
+        seen, clean = set(), []
+        for h in hosts:
+            if isinstance(h, str):
+                h = h.strip()
+                if h and len(h) <= 200 and h not in seen:
+                    seen.add(h)
+                    clean.append(h)
+        if clean:
+            out[dept] = clean
     return out
 
 
@@ -161,7 +186,8 @@ def logout():
 def api_filters():
     try:
         access = _current_access()
-        opts = s3_service.filter_options(departments=access["departments"])
+        opts = s3_service.filter_options(departments=access["departments"],
+                                         allowed_hosts=access["hosts"])
         # Show the user's full assigned set (even a department with no files yet),
         # not just the ones that happen to have records.
         opts["departments"] = sorted(access["departments"], key=str.lower)
@@ -199,6 +225,7 @@ def api_search():
             host=request.args.get("host", ""),
             department=request.args.get("department", ""),
             allowed_departments=access["departments"],
+            allowed_hosts=access["hosts"],
             limit=per_page,
             offset=(page - 1) * per_page,
             sort=request.args.get("sort", ""),
@@ -238,7 +265,7 @@ def api_download_one():
     access = _current_access()
     if not access["can_download"]:
         abort(403, "Your account is view-only — downloads are disabled.")
-    if not s3_service.key_allowed(key, access["departments"]):
+    if not s3_service.key_allowed(key, access["departments"], access["hosts"]):
         abort(404, "File not found.")
 
     if s3_service.DEMO_MODE:
@@ -263,7 +290,7 @@ def api_view_one():
     including view-only accounts that may not use /api/download."""
     key = request.args.get("key", "")
     access = _current_access()
-    if not s3_service.key_allowed(key, access["departments"]):
+    if not s3_service.key_allowed(key, access["departments"], access["hosts"]):
         abort(404, "File not found.")
 
     if s3_service.DEMO_MODE:
@@ -307,7 +334,8 @@ def api_download_bulk():
         return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
     data = request.get_json(silent=True) or {}
     keys = data.get("keys") or []
-    keys = [k for k in keys if isinstance(k, str) and s3_service.key_allowed(k, access["departments"])]
+    keys = [k for k in keys if isinstance(k, str)
+            and s3_service.key_allowed(k, access["departments"], access["hosts"])]
     if not keys:
         return jsonify({"error": "No files selected."}), 400
 
@@ -338,10 +366,14 @@ def api_download_bulk():
 @app.route("/api/admin/users", methods=["GET"])
 @admin_required
 def api_users_list():
+    # hosts_by_department drives the admin host pickers (non-blocking: empty
+    # lists while the index is still warming, filled on the next load).
+    opts = s3_service.filter_options()
     return jsonify({
         "admins": sorted(auth.get_admins().keys(), key=str.lower),
         "users": auth.list_users(),
         "departments": list(s3_service.DEPARTMENTS),
+        "hosts_by_department": opts.get("hosts_by_department", {}),
     })
 
 
@@ -349,11 +381,13 @@ def api_users_list():
 @admin_required
 def api_users_create():
     data = request.get_json(silent=True) or {}
+    departments = _clean_departments(data.get("departments"))
     try:
         auth.create_user(
             data.get("username", ""), data.get("password", ""),
             created_by=session.get("user", ""),
-            departments=_clean_departments(data.get("departments")),
+            departments=departments,
+            hosts=_clean_hosts(data.get("hosts"), departments),
             can_download=bool(data.get("can_download", False)),
         )
         return jsonify({"ok": True})
@@ -364,12 +398,21 @@ def api_users_create():
 @app.route("/api/admin/users/<username>", methods=["PATCH"])
 @admin_required
 def api_users_update(username):
-    """Update an existing user's department grant and/or download permission."""
+    """Update an existing user's departments, host restriction and/or download
+    permission."""
     data = request.get_json(silent=True) or {}
     departments = _clean_departments(data.get("departments")) if "departments" in data else None
+    hosts = None
+    if "hosts" in data:
+        # Validate against the departments being set now, or the user's current
+        # grant when only the hosts are changing.
+        target = departments if departments is not None \
+            else auth.user_access(username)["departments"]
+        hosts = _clean_hosts(data.get("hosts"), target)
     can_download = bool(data["can_download"]) if "can_download" in data else None
     try:
-        auth.update_user_access(username, departments=departments, can_download=can_download)
+        auth.update_user_access(username, departments=departments, hosts=hosts,
+                                can_download=can_download)
         return jsonify({"ok": True})
     except ValueError as e:
         return jsonify({"error": str(e)}), 404

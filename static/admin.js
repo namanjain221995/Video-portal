@@ -9,6 +9,9 @@
   // All departments the bucket exposes (from the server). Used to render the
   // checkbox grids both on the create form and on every user row.
   let allDepartments = [];
+  // department -> [hosts] from the S3 index; drives the per-department host
+  // pickers (empty while the index is still warming).
+  let hostsByDept = {};
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
@@ -40,6 +43,65 @@
       .map((cb) => cb.value);
   }
 
+  // Per-department host pickers: one collapsible box per SELECTED department.
+  // Ticking hosts LIMITS the user to them; all unticked = the whole department.
+  function renderHostBoxes(container, depts, selectedHosts) {
+    selectedHosts = selectedHosts || {};
+    if (!depts || !depts.length) {
+      container.innerHTML =
+        '<span class="user-meta">Select a department above to restrict its hosts.</span>';
+      return;
+    }
+    container.innerHTML = depts.map((d) => {
+      const hosts = hostsByDept[d] || [];
+      const chosen = new Set(selectedHosts[d] || []);
+      // Union: granted hosts missing from the (possibly still-warming) index stay
+      // visible and ticked, so saving never silently drops an existing restriction.
+      const display = hosts.slice();
+      chosen.forEach((h) => { if (display.indexOf(h) === -1) display.push(h); });
+      const inner = display.length
+        ? display.map((h) => `
+            <label class="dept-check">
+              <input type="checkbox" value="${esc(h)}"${chosen.has(h) ? " checked" : ""}>
+              <span>${esc(h)}</span>
+            </label>`).join("")
+        : '<span class="user-meta">No hosts indexed yet for this department.</span>';
+      const n = chosen.size;
+      const sum = n ? `${n} host${n === 1 ? "" : "s"} only` : "All hosts";
+      return `
+        <details class="host-box" data-dept="${esc(d)}"${n ? " open" : ""}>
+          <summary>${esc(d)} — <span class="host-sum">${esc(sum)}</span></summary>
+          <p class="user-meta host-hint">Tick hosts to limit this user to them; leave all unticked for the whole department.</p>
+          <div class="host-list dept-checks">${inner}</div>
+        </details>`;
+    }).join("");
+    // Live "N hosts only / All hosts" summary as boxes are ticked.
+    container.querySelectorAll(".host-box").forEach((det) => {
+      det.addEventListener("change", () => {
+        const n = det.querySelectorAll("input:checked").length;
+        det.querySelector(".host-sum").textContent =
+          n ? `${n} host${n === 1 ? "" : "s"} only` : "All hosts";
+      });
+    });
+  }
+
+  function readHostChecks(container) {
+    const out = {};
+    container.querySelectorAll(".host-box").forEach((det) => {
+      const picked = Array.from(det.querySelectorAll("input:checked")).map((cb) => cb.value);
+      if (picked.length) out[det.dataset.dept] = picked;
+    });
+    return out;
+  }
+
+  // Keep a host container in sync with its department checkboxes (preserving
+  // any host ticks already made for departments that stay selected).
+  function wireHostSync(deptBox, hostBox) {
+    deptBox.addEventListener("change", () => {
+      renderHostBoxes(hostBox, readDeptChecks(deptBox), readHostChecks(hostBox));
+    });
+  }
+
   async function load() {
     try {
       const resp = await fetch("/api/admin/users");
@@ -48,7 +110,9 @@
       const data = await resp.json();
       if (!resp.ok) { showNotice(data.error || "Could not load users.", "error"); return; }
       allDepartments = data.departments || [];
+      hostsByDept = data.hosts_by_department || {};
       renderDeptChecks($("new-depts"), []);     // create-form checkboxes
+      renderHostBoxes($("new-hosts"), [], {});
       renderUsers(data.users || []);
       renderAdmins(data.admins || []);
     } catch (e) {
@@ -82,6 +146,7 @@
           </div>
           <div class="user-access">
             <div class="dept-checks user-depts"></div>
+            <div class="host-restrict user-hosts"></div>
             <div class="user-access-actions">
               <select class="input perm-select">
                 <option value="view"${u.can_download ? "" : " selected"}>View only</option>
@@ -94,9 +159,14 @@
         </div>`;
     }).join("");
 
-    // Fill each row's checkbox grid with that user's current departments, then wire buttons.
+    // Fill each row's checkbox grid with that user's current departments + host
+    // restriction, then wire buttons.
     box.querySelectorAll(".user-row").forEach((row, i) => {
-      renderDeptChecks(row.querySelector(".user-depts"), users[i].departments || []);
+      const deptBox = row.querySelector(".user-depts");
+      const hostBox = row.querySelector(".user-hosts");
+      renderDeptChecks(deptBox, users[i].departments || []);
+      renderHostBoxes(hostBox, users[i].departments || [], users[i].hosts || {});
+      wireHostSync(deptBox, hostBox);
       row.querySelector("[data-save]").addEventListener("click", (e) => saveAccess(row, e.currentTarget));
       row.querySelector("[data-del]").addEventListener("click", (e) =>
         deleteUser(row.dataset.user, e.currentTarget));
@@ -106,6 +176,7 @@
   async function saveAccess(row, btn) {
     const username = row.dataset.user;
     const departments = readDeptChecks(row.querySelector(".user-depts"));
+    const hosts = readHostChecks(row.querySelector(".user-hosts"));
     const can_download = row.querySelector(".perm-select").value === "download";
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>';
@@ -113,7 +184,7 @@
       const resp = await fetch("/api/admin/users/" + encodeURIComponent(username), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ departments, can_download }),
+        body: JSON.stringify({ departments, hosts, can_download }),
       });
       if (resp.status === 401) { location.href = "/login"; return; }
       const data = await resp.json().catch(() => ({}));
@@ -159,6 +230,7 @@
           username,
           password: $("new-password").value,
           departments: readDeptChecks($("new-depts")),
+          hosts: readHostChecks($("new-hosts")),
           can_download: $("new-perm").value === "download",
         }),
       });
@@ -168,6 +240,7 @@
       showNotice(`Created user "${username}".`, "ok");
       $("create-form").reset();
       renderDeptChecks($("new-depts"), []);
+      renderHostBoxes($("new-hosts"), [], {});
       load();
     } catch (e2) {
       showNotice("Network error creating user.", "error");
@@ -178,5 +251,6 @@
   }
 
   $("create-form").addEventListener("submit", createUser);
+  wireHostSync($("new-depts"), $("new-hosts"));
   load();
 })();
