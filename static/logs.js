@@ -23,12 +23,14 @@
     user_create: "Created user",
     user_update: "Updated user",
     user_delete: "Deleted user",
+    logs_cleared: "Cleared all logs",
   };
 
   const DETAIL_LABELS = {
     attempted_username: "Attempted username",
     can_download: "Download access",
     company: "Company",
+    deleted_events: "Deleted entries",
     date: "Search date",
     error: "Error",
     failure_reason: "Failure reason",
@@ -80,6 +82,11 @@
     notice.className = "notice show notice-error";
   }
 
+  function showOk(message) {
+    notice.textContent = message;
+    notice.className = "notice show notice-ok";
+  }
+
   function clearNotice() {
     notice.textContent = "";
     notice.className = "notice";
@@ -102,7 +109,7 @@
     if (key === "search") return "search";
     if (key === "view" || key.includes("preview") || key.includes("view")) return "view";
     if (key.includes("download")) return "download";
-    if (key.startsWith("user_")) return "admin";
+    if (key.startsWith("user_") || key === "logs_cleared") return "admin";
     if (key === "refresh") return "refresh";
     return "other";
   }
@@ -312,6 +319,9 @@
         <div class="log-recording-meta">${department ? `<strong>${esc(department)}</strong>` : '<span class="log-none">—</span>'}${fileType ? `<span>${esc(humanize(fileType))}</span>` : ""}</div>
       </td>
       <td data-label="Details" class="log-details-cell">${renderDetails(event)}</td>
+      <td data-label="" class="col-actions">${event.id != null
+        ? `<button type="button" class="btn btn-danger btn-sm log-del-btn" data-id="${esc(event.id)}" title="Delete this log entry">Delete</button>`
+        : ""}</td>
     </tr>`;
   }
 
@@ -367,11 +377,15 @@
       <table class="results log-table">
         <thead><tr>
           <th>Activity</th><th>User</th><th>Action / status</th><th>Candidate</th><th>Host</th>
-          <th>Meeting ID</th><th>Recording / search date</th><th>Department / type</th><th>Details</th>
+          <th>Meeting ID</th><th>Recording / search date</th><th>Department / type</th><th>Details</th><th></th>
         </tr></thead>
         <tbody>${events.map(renderEvent).join("")}</tbody>
       </table>
     </div>`;
+
+    logsArea.querySelectorAll(".log-del-btn").forEach((button) => {
+      button.addEventListener("click", () => deleteEntry(button.dataset.id, button));
+    });
   }
 
   function hidePagination() {
@@ -518,12 +532,75 @@
     loadLogs();
   }
 
+  async function deleteEntry(id, button) {
+    if (id == null || id === "") return;
+    if (!window.confirm("Delete this single log entry?\n\nThis permanently removes just this one event and cannot be undone.")) return;
+
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner"></span>';
+    clearNotice();
+    try {
+      const response = await fetch("/api/admin/logs/" + encodeURIComponent(id), {
+        method: "DELETE",
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      });
+      if (response.status === 401) { location.href = "/login"; return; }
+      if (response.status === 403) { location.href = "/search"; return; }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Could not delete the log entry.");
+      // Reload the current page so totals + pagination stay correct.
+      await loadLogs();
+      showOk("Log entry deleted.");
+    } catch (error) {
+      showNotice(error && error.message ? error.message : "Network error deleting the log entry.");
+      button.disabled = false;
+      button.textContent = "Delete";
+    }
+  }
+
+  async function clearAllLogs() {
+    const button = $("btn-clear-all-logs");
+    if (!window.confirm(
+      "Delete ALL activity logs permanently?\n\n" +
+      "This removes every recorded event for every user and cannot be undone. " +
+      "A single entry noting that you cleared the logs will be recorded."
+    )) return;
+
+    button.disabled = true;
+    button.innerHTML = '<span class="spinner"></span> Clearing…';
+    clearNotice();
+    try {
+      const response = await fetch("/api/admin/logs", {
+        method: "DELETE",
+        headers: { "Accept": "application/json" },
+        cache: "no-store",
+      });
+      if (response.status === 401) { location.href = "/login"; return; }
+      if (response.status === 403) { location.href = "/search"; return; }
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Could not clear activity logs.");
+      const deleted = Number(data.deleted || 0);
+      // Reset filters + page so the single "cleared" entry is visible, then reload.
+      $("logs-form").reset();
+      page = 1;
+      await loadLogs(true);
+      showOk(`Cleared ${deleted.toLocaleString()} log entr${deleted === 1 ? "y" : "ies"}.`);
+    } catch (error) {
+      showNotice(error && error.message ? error.message : "Network error clearing activity logs.");
+    } finally {
+      button.disabled = false;
+      button.innerHTML = "🗑 Clear all logs";
+    }
+  }
+
   $("logs-form").addEventListener("submit", (event) => {
     event.preventDefault();
     page = 1;
     loadLogs();
   });
   $("btn-clear-logs").addEventListener("click", clearFilters);
+  $("btn-clear-all-logs").addEventListener("click", clearAllLogs);
   $("logs-per-page").addEventListener("change", () => {
     page = 1;
     loadLogs(true);

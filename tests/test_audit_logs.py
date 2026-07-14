@@ -133,6 +133,74 @@ class AuditLogIntegrationTests(unittest.TestCase):
             self.assertEqual(page.status_code, 200)
             self.assertEqual(page.headers.get("Cache-Control"), "no-store")
 
+    def test_clear_all_logs_is_admin_only_and_self_audited(self):
+        with portal.app.test_client() as client:
+            # Anonymous and non-admin callers may not clear the trail.
+            self.assertEqual(client.delete("/api/admin/logs").status_code, 401)
+            with client.session_transaction() as current_session:
+                current_session["user"] = "ordinary-user"
+                current_session["role"] = "user"
+            self.assertEqual(client.delete("/api/admin/logs").status_code, 403)
+
+        # Seed a handful of events, then clear them as an admin.
+        for number in range(6):
+            self.assertTrue(audit_service.record_event("search", username=f"user-{number}"))
+        self.assertEqual(audit_service.list_events()["total"], 6)
+
+        with portal.app.test_client() as client:
+            self._login_admin(client)  # adds a 'login' event -> at least 7 rows
+            seeded_total = client.get("/api/admin/logs").get_json()["total"]
+            self.assertGreaterEqual(seeded_total, 7)
+
+            response = client.delete("/api/admin/logs")
+            self.assertEqual(response.status_code, 200)
+            payload = response.get_json()
+            self.assertTrue(payload["ok"])
+            self.assertEqual(payload["deleted"], seeded_total)
+
+            after = client.get("/api/admin/logs").get_json()
+
+        # The clear wipes everything, then records exactly one self-audit entry.
+        self.assertEqual(after["total"], 1)
+        cleared = after["events"][0]
+        self.assertEqual(cleared["action"], "logs_cleared")
+        self.assertEqual(cleared["username"], _ADMIN_USER)
+        self.assertEqual(cleared["role"], "admin")
+        self.assertEqual(cleared["details"]["deleted_events"], seeded_total)
+
+    def test_delete_single_log_entry_is_admin_only_and_leaves_no_marker(self):
+        for number in range(4):
+            self.assertTrue(audit_service.record_event("search", username=f"user-{number}"))
+        target_id = audit_service.list_events()["events"][0]["id"]
+
+        with portal.app.test_client() as client:
+            # Anonymous / non-admin cannot delete a single entry.
+            self.assertEqual(client.delete(f"/api/admin/logs/{target_id}").status_code, 401)
+            with client.session_transaction() as current_session:
+                current_session["user"] = "ordinary-user"
+                current_session["role"] = "user"
+            self.assertEqual(client.delete(f"/api/admin/logs/{target_id}").status_code, 403)
+
+            self._login_admin(client)
+            before = client.get("/api/admin/logs").get_json()["total"]
+
+            # A non-integer path never matches the route; a missing id is a 404.
+            self.assertEqual(client.delete("/api/admin/logs/not-a-number").status_code, 404)
+            self.assertEqual(client.delete("/api/admin/logs/99999999").status_code, 404)
+
+            self.assertEqual(client.delete(f"/api/admin/logs/{target_id}").status_code, 200)
+            self.assertEqual(client.delete(f"/api/admin/logs/{target_id}").status_code, 404)
+
+            after = client.get("/api/admin/logs").get_json()
+
+        # Exactly one row removed, and NO self-audit marker was written.
+        self.assertEqual(after["total"], before - 1)
+        remaining_ids = {event["id"] for event in after["events"]}
+        self.assertNotIn(target_id, remaining_ids)
+        self.assertFalse(any(
+            event["action"] in ("log_deleted", "logs_cleared") for event in after["events"]
+        ))
+
     def test_download_refresh_user_changes_and_logout_are_recorded(self):
         child_password = "ChildPasswordMustNotBeLogged"
         with portal.app.test_client() as client:

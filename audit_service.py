@@ -572,3 +572,65 @@ def list_events(
         }
     finally:
         connection.close()
+
+
+def clear_events() -> int:
+    """Delete every audit event and return the number of rows removed.
+
+    Backs the admin "clear all logs" action. The caller is responsible for
+    recording a follow-up event (e.g. ``logs_cleared``) so the trail always
+    shows who cleared it and when — this function never writes one itself.
+    Raises on failure so the caller can surface an error to the admin.
+    """
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect()
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute("DELETE FROM audit_events")
+        deleted = cursor.rowcount if (cursor.rowcount or 0) > 0 else 0
+        connection.commit()
+        return deleted
+    except Exception:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        logger.exception("Unable to clear audit events")
+        raise
+    finally:
+        if connection is not None:
+            connection.close()
+
+
+def delete_event(event_id: Any) -> bool:
+    """Delete a single audit event by id. Returns True if a row was removed,
+    False if the id was invalid or matched nothing. Raises only on a real
+    database error so the caller can surface it.
+    """
+    try:
+        target = int(event_id)
+    except (TypeError, ValueError):
+        return False
+
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = _connect()
+        connection.execute("BEGIN IMMEDIATE")
+        cursor = connection.execute(
+            "DELETE FROM audit_events WHERE id = ?", (target,)
+        )
+        removed = (cursor.rowcount or 0) > 0
+        connection.commit()
+        return removed
+    except Exception:
+        if connection is not None:
+            try:
+                connection.rollback()
+            except sqlite3.Error:
+                pass
+        logger.exception("Unable to delete audit event")
+        raise
+    finally:
+        if connection is not None:
+            connection.close()

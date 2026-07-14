@@ -612,6 +612,36 @@ def api_audit_logs():
         return jsonify({"error": "Could not read audit logs."}), 500
 
 
+@app.route("/api/admin/logs", methods=["DELETE"])
+@admin_required
+def api_audit_logs_clear():
+    """Permanently delete every audit event. The clear is itself audited, so the
+    freshly emptied trail immediately shows who cleared it and how many rows went."""
+    try:
+        deleted = audit_service.clear_events()
+    except Exception:
+        app.logger.exception("Could not clear the audit log")
+        return jsonify({"error": "Could not clear audit logs."}), 500
+    _audit("logs_cleared", details={"deleted_events": deleted})
+    return jsonify({"ok": True, "deleted": deleted})
+
+
+@app.route("/api/admin/logs/<int:event_id>", methods=["DELETE"])
+@admin_required
+def api_audit_log_delete(event_id):
+    """Delete a single audit entry. Unlike the full clear, an individual removal
+    is not itself audited — otherwise deleting one row would only replace it with
+    another and the count could never drop."""
+    try:
+        removed = audit_service.delete_event(event_id)
+    except Exception:
+        app.logger.exception("Could not delete the audit log entry")
+        return jsonify({"error": "Could not delete the log entry."}), 500
+    if not removed:
+        return jsonify({"error": "Log entry not found."}), 404
+    return jsonify({"ok": True})
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 def _s3_err(e: Exception) -> str:
     msg = str(e)
