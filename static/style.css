@@ -346,7 +346,14 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 .modal {
   background: var(--panel); border-radius: var(--radius); box-shadow: var(--shadow);
   width: 100%; max-width: 900px; max-height: 88vh; display: flex; flex-direction: column;
-  overflow: hidden;
+  overflow: hidden; position: relative;
+}
+/* Traceable watermark tiled over the whole preview (username + time). Non-clickable
+   so it never blocks the video/close controls. Hidden until a preview opens. */
+.watermark-layer {
+  position: absolute; inset: 0; z-index: 5; display: none;
+  pointer-events: none; background-repeat: repeat; background-position: 0 0;
+  mix-blend-mode: screen;
 }
 .modal-head { display: flex; align-items: center; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
 .modal-head h3 { margin: 0; font-size: 15px; word-break: break-all; }
@@ -361,6 +368,44 @@ audio.preview-media { background: transparent; }
   font-size: 13px; line-height: 1.5; color: #e2e8f0;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+
+/* Screen-capture warning toast (anti-capture.js) */
+.capture-toast {
+  position: fixed; top: 18px; left: 50%; transform: translate(-50%, -140%);
+  z-index: 90; max-width: min(92vw, 560px);
+  background: #7f1d1d; color: #fff; font-size: 14px; font-weight: 600;
+  padding: 12px 18px; border-radius: 10px; box-shadow: var(--shadow);
+  border: 1px solid #b91c1c; text-align: center;
+  opacity: 0; transition: transform .25s ease, opacity .25s ease; pointer-events: none;
+}
+.capture-toast.show { transform: translate(-50%, 0); opacity: 1; }
+
+/* Capture events in the admin log */
+.log-action-capture { background: var(--danger-soft); color: #b91c1c; }
+
+/* Webcam capture photo thumbnail in the admin log */
+.capture-photo-link { display: inline-block; margin: 0 0 6px; }
+.capture-thumb {
+  width: 60px; height: 44px; object-fit: cover; border-radius: 6px;
+  border: 1px solid var(--line-2); display: block;
+}
+
+/* First-use camera enrolment gate (full-screen, blocks the page) */
+.camera-gate {
+  position: fixed; inset: 0; z-index: 100;
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  background: rgba(2, 6, 23, .78);
+}
+.camera-gate-card {
+  width: 100%; max-width: 460px; background: var(--panel);
+  border-radius: var(--radius); box-shadow: var(--shadow); padding: 30px 28px; text-align: center;
+}
+.camera-gate-icon { font-size: 40px; margin-bottom: 8px; }
+.camera-gate-card h2 { margin: 0 0 10px; font-size: 20px; }
+.camera-gate-card p { margin: 0 0 12px; color: var(--ink-soft); font-size: 14px; line-height: 1.55; }
+.camera-gate-note { font-weight: 600; color: var(--ink); }
+.camera-gate-status { min-height: 18px; margin: 6px 0 14px; font-size: 13px; color: var(--ink-soft); }
+.camera-gate-status.bad { color: #b91c1c; font-weight: 600; }
 
 @media (max-width: 760px) {
   .filters { grid-template-columns: 1fr 1fr; }

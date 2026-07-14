@@ -505,6 +505,7 @@
     const cat = rec.category || "other";
     previewTitle.textContent = rec.filename || "Preview";
     previewBody.innerHTML = '<div class="empty"><div class="spinner spinner-lg"></div>Loading…</div>';
+    previewModal.dataset.previewKey = rec.key || "";   // anti-capture.js reads this
     previewModal.style.display = "flex";
 
     if (cat === "video") {
@@ -542,6 +543,7 @@
 
   function closePreview() {
     previewModal.style.display = "none";
+    previewModal.dataset.previewKey = "";
     previewBody.innerHTML = "";   // stop any playing media
   }
 

@@ -3,6 +3,7 @@ users.json
 users.json.tmp
 audit.db
 audit.db-*
+captures/
 venv/
 .venv/
 .verify_venv/

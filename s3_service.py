@@ -629,6 +629,14 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
 # ─────────────────────────────────────────────────────────────────────────────
 # Downloads
 # ─────────────────────────────────────────────────────────────────────────────
+def record_for_key(key: str):
+    """The parsed record for an exact key, or None. For logging/context only —
+    callers that gate access must still use key_allowed()."""
+    if not key:
+        return None
+    return _records_by_key().get(key)
+
+
 def key_allowed(key: str, allowed_departments, allowed_hosts=None) -> bool:
     """Server-side gate for download/view: the key must exist in the index, sit in
     a department the caller was granted AND (when a host restriction applies) be
