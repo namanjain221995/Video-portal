@@ -4,20 +4,30 @@ s3_service.py
 All S3 access for the Interview-Success recording portal lives here.
 
 The bucket has several department folders at the top level (HR, Interview-Success,
-Marketing, …). The FIRST path segment is the department; below it there are THREE
-key layouts (all handled by _parse_key):
+Marketing, …). A department is normally the FIRST path segment, but it may also be
+NESTED two levels deep — Training was split into its own sub-departments:
+
+    Training/Resume-Based/  Training/Advanced/
+    Training/Interview-Readiness/  Training/Other/
+
+so the department is whichever configured DEPARTMENTS entry matches the longest
+leading run of segments (see _department_of). Everything below the department is
+one of THREE key layouts (all handled by _parse_key):
 
     Layout A (10 segments below the department) — Interview-Success:
         {Dept}/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{MeetingID}/{FileType}/{file}
     Layout B (11 segments — extra MeetingID + a Time-*-IST folder) — Interview-Success:
         {Dept}/{Host}/{Year}/{Month}/{Candidate}/{MeetingID}/{Company}/{Date}/{Round}/{Time-*-IST}/{FileType}/{file}
-    Layout C (9 segments — NO Company/Round, has a Time-*-IST folder) — HR/Marketing/Training/…:
+    Layout C (9 segments — NO Company/Round, has a Time-*-IST folder) — HR/Marketing/…
+    and every Training/* sub-department, where {Host} is the trainer and
+    {Candidate} is a single trainee or a hyphen-joined group roster:
         {Dept}/{Host}/{Year}/{Month}/{Candidate}/{Date}/{Time-*-IST}/{MeetingID}/{FileType}/{file}
 
-Reliable anchors in ALL layouts:  department = seg[0], host/year/month/candidate =
-the next four, file_type = seg[-2], filename = seg[-1]; the date matches YYYY-MM-DD,
-the meeting id is the all-digit segment, company is the label just before the date
-and round the one just after (absent in layout C, which has neither).
+Reliable anchors in ALL layouts:  host/year/month/candidate = the first four
+segments BELOW the department, file_type = seg[-2], filename = seg[-1]; the date
+matches YYYY-MM-DD, the meeting id is the all-digit segment, company is the label
+just before the date and round the one just after (absent in layout C, which has
+neither).
 
 The module lists everything under Interview-Success/, parses each key into a
 structured record, caches the result (TTL + a shared on-disk index so the 3
@@ -48,15 +58,46 @@ from botocore.config import Config
 BUCKET       = os.environ.get("S3_BUCKET_NAME", "zoom-automation-bucket")
 ROOT_PREFIX  = os.environ.get("ROOT_PREFIX", "Interview-Success/")
 REGION       = os.environ.get("AWS_REGION", "us-east-1")
-# Top-level "department" folders in the bucket. Each holds the same internal
-# layout ({Host}/{Year}/{Month}/{Candidate}/…). The portal scans every one of
-# these and tags each record with its department; access is then granted per
-# user by an admin. Override via DEPARTMENTS="HR,Marketing,…" in .env.
-DEPARTMENTS  = [d.strip() for d in os.environ.get(
+# "Department" folders in the bucket. Each holds the same internal layout
+# ({Host}/{Year}/{Month}/{Candidate}/…). The portal scans every one of these and
+# tags each record with its department; access is then granted per user by an
+# admin. Override via DEPARTMENTS="HR,Marketing,…" in .env.
+#
+# An entry may be NESTED ("Training/Resume-Based") when a top-level folder was
+# split into sub-departments that are granted independently. Listing a parent and
+# its children together is safe: only the parent is scanned, and each key is
+# tagged with the LONGEST matching entry (see _department_of / _scan_prefixes).
+#
+# An entry may instead END IN "/*" ("Training/*"), which means: every immediate
+# child folder of that parent is its own department, discovered from the bucket
+# rather than listed here. A sub-department added in S3 later then appears by
+# itself on the next index refresh — no .env edit and no restart. Discovery only
+# makes a department VISIBLE and grantable; nobody can read it until an admin
+# ticks it for them, so this never widens anyone's access on its own.
+_DEPARTMENTS_RAW = [d.strip().strip("/") for d in os.environ.get(
     "DEPARTMENTS",
-    "HR,Interview-Success,Marketing,Training,Customer-Success,Techsphere,Executive-Assistant,"
-    "QMS,Other,CEO,COO,Business-Development,Advanced-Training",
-).split(",") if d.strip()]
+    "HR,Interview-Success,Marketing,Customer-Success,Techsphere,Executive-Assistant,"
+    "QMS,Other,CEO,COO,Business-Development,Advanced-Training,Training/*",
+).split(",") if d.strip().strip("/")]
+
+
+def _split_department_config(entries):
+    """(exact departments, auto-discovery parents) from the configured entries."""
+    exact, parents = [], []
+    for entry in entries:
+        if entry.endswith("/*"):
+            parent = entry[:-2].strip("/")
+            if parent and parent not in parents:
+                parents.append(parent)
+        elif entry not in exact:
+            exact.append(entry)
+    return exact, parents
+
+
+# DEPARTMENTS stays the list of explicitly configured names (what most callers
+# mean); AUTO_PARENTS holds the "Parent/*" roots whose children are discovered.
+# Use all_departments() when you need everything the portal currently knows.
+DEPARTMENTS, AUTO_PARENTS = _split_department_config(_DEPARTMENTS_RAW)
 CACHE_TTL    = int(os.environ.get("CACHE_TTL_SEC", "300"))
 URL_EXPIRY   = int(os.environ.get("PRESIGNED_URL_EXPIRY_SEC", "3600"))
 DEMO_MODE    = os.environ.get("DEMO_MODE", "false").strip().lower() in ("1", "true", "yes")
@@ -93,6 +134,10 @@ _ROOT_DEPTH = len([p for p in ROOT_PREFIX.split("/") if p])
 _lock = threading.Lock()          # guards _cache reads/writes (fast)
 _scan_lock = threading.Lock()     # serialises (re)builds so we never scan twice at once
 _cache = {"records": None, "by_key": None, "options": None, "ts": 0.0}
+# Departments seen in any index this process has held (guarded by _lock). Grows
+# only — see the note in _store() for why a department must not become unknown
+# again once discovered.
+_seen_departments = set()
 _s3 = None
 
 
@@ -154,6 +199,64 @@ _TIME_RE = re.compile(r"^time-.*ist$", re.I)
 def _is_time(s: str) -> bool:
     return bool(_TIME_RE.match(s or ""))
 
+
+# ── Department resolution (supports nested entries like "Training/Resume-Based") ──
+_DEPT_SET = set(DEPARTMENTS)
+_DEPT_MAX_DEPTH = max((len(d.split("/")) for d in DEPARTMENTS), default=1)
+
+
+def _department_of(parts):
+    """(department, segments_consumed) for a key already split on "/".
+
+    An explicitly configured entry wins, using the LONGEST match — so a key under
+    Training/Resume-Based/… is tagged with the sub-department rather than with a
+    plain "Training" that also happens to be configured. Otherwise, if the key
+    sits under a "Parent/*" auto-discovery root, the department is the parent PLUS
+    its next segment, which is how a sub-department created in S3 later gets
+    indexed without appearing in any config. Returns (None, 0) for a key outside
+    every department, so an unrelated top-level folder can never enter the index."""
+    for depth in range(min(_DEPT_MAX_DEPTH, len(parts)), 0, -1):
+        candidate = "/".join(parts[:depth])
+        if candidate in _DEPT_SET:
+            return candidate, depth
+    for parent in AUTO_PARENTS:
+        depth = len(parent.split("/"))
+        # Need a child segment AND something below it, else this is a stray file
+        # sitting directly in the parent folder rather than in a sub-department.
+        if len(parts) > depth + 1 and "/".join(parts[:depth]) == parent:
+            return "/".join(parts[:depth + 1]), depth + 1
+    return None, 0
+
+
+def _scan_prefixes():
+    """The minimal set of prefixes to list. A department nested inside another
+    configured department (or inside an auto-discovery parent) is dropped: listing
+    the ancestor already returns its keys, and _department_of tags each one with
+    the most specific match. Without this, having both "Training/*" and
+    "Training/Advanced" configured would index every Advanced object twice."""
+    # dict.fromkeys dedupes while keeping order: "Training" and "Training/*"
+    # resolve to the same root, and listing it twice would index every object
+    # underneath it twice.
+    roots = list(dict.fromkeys(list(DEPARTMENTS) + list(AUTO_PARENTS)))
+    return [d for d in roots
+            if not any(other != d and d.startswith(other + "/") for other in roots)]
+
+
+def all_departments():
+    """Every department the portal currently knows about: the explicitly
+    configured ones plus any discovered under a "Parent/*" entry in the live index.
+
+    This is the vocabulary for granting access and for the admin/search pickers —
+    prefer it over DEPARTMENTS anywhere a user-facing list or a grant is validated,
+    or a newly discovered sub-department would be unreachable and, worse, an
+    existing grant naming it would be treated as invalid."""
+    if DEMO_MODE:
+        discovered = {r["department"] for r in DEMO_RECORDS}
+    else:
+        with _lock:
+            discovered = set(_seen_departments)
+    return sorted(set(DEPARTMENTS) | discovered, key=str.lower)
+
 # Group sessions (e.g. Advanced-Training) put EVERY attendee in the candidate
 # folder, hyphen-joined, often behind a numeric id prefix:
 #     700758249_Shafahad_Mohammed-Abdu_Raziq-Nandini_K-Ram_Reddy-…
@@ -204,13 +307,18 @@ def _intern_rec(d: dict) -> dict:
 
 def _parse_key(key: str, size):
     """Turn an S3 key into a structured record, or None if it is not a leaf file
-    under the expected {Department}/{Host}/… layout (folder placeholders, short keys).
+    under the expected {Department}/{Host}/… layout (folder placeholders, short
+    keys, keys outside every configured department).
 
-    The first path segment is the department (HR, Interview-Success, …); the rest
-    is the per-department layout the parser already understood."""
+    The department is the longest configured DEPARTMENTS entry matching the start
+    of the key — one segment for HR/Interview-Success/…, two for the nested
+    Training/* sub-departments. Everything after it is the per-department layout
+    the parser already understood, so a nested department needs no new layout."""
     parts = key.split("/")
-    department = parts[0]
-    seg = parts[1:]                      # everything below the department folder
+    department, depth = _department_of(parts)
+    if department is None:
+        return None
+    seg = parts[depth:]                  # everything below the department folder
     if len(seg) < 9:
         return None
 
@@ -270,8 +378,9 @@ def _scan_s3():
     records = []
     paginator = client.get_paginator("list_objects_v2")
     # List each department folder separately so an unrelated top-level prefix in
-    # the bucket can never leak into the index.
-    for dept in DEPARTMENTS:
+    # the bucket can never leak into the index. Nested departments are covered by
+    # their parent's listing when one is configured (see _scan_prefixes).
+    for dept in _scan_prefixes():
         for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{dept}/"):
             for obj in page.get("Contents", []):
                 rec = _parse_key(obj["Key"], obj.get("Size", 0))
@@ -283,7 +392,7 @@ def _scan_s3():
 # Bump whenever the record shape or DEPARTMENTS coverage changes: a persisted
 # index with an older schema is rejected, forcing ONE clean re-scan on the first
 # boot after a deploy instead of serving pre-upgrade records for up to INDEX_TTL.
-INDEX_SCHEMA = 2
+INDEX_SCHEMA = 3   # 3: nested departments (Training/* split into sub-departments)
 
 
 def _load_disk_index(max_age):
@@ -378,6 +487,11 @@ def _store(records):
         _cache["by_key"] = by_key
         _cache["options"] = options
         _cache["ts"] = time.time()
+        # Remember every department ever seen in this process. An auto-discovered
+        # sub-department must not stop being grantable just because the cache is
+        # momentarily cold — otherwise an admin saving a user mid-refresh would
+        # have that user's grant rejected as an unknown department.
+        _seen_departments.update(options.get("departments") or ())
 
 
 def _save_disk_index(records):
@@ -804,7 +918,7 @@ DEMO_RECORDS += _mk("Marketing", "Ishita_Aggarwal", "Bala_Praneeth_Reddy_Basani"
                     "2026-06-18", "Final_Round", "96355121200",
                     [("MP4", "rec_96355121200.mp4", 198_000_000),
                      ("TRANSCRIPT", "transcript_96355121200.vtt", 77_900)])
-DEMO_RECORDS += _mk("Training", "Ishita_Aggarwal", "Dharani_Katta", "Microsoft",
+DEMO_RECORDS += _mk("Customer-Success", "Ishita_Aggarwal", "Dharani_Katta", "Microsoft",
                     "2026-06-20", "Introduction_Call", "96355121888",
                     [("MP4", "rec_96355121888.mp4", 167_000_000),
                      ("M4A", "audio_96355121888.m4a", 11_200_000),
@@ -835,6 +949,17 @@ DEMO_RECORDS += _mk_c("QMS", "Priya_Nair", "Rohan_Mehta",
                       "2026-06-21", "Time-4-00-PM-IST", "96355125555",
                       [("MP4", "rec_96355125555.mp4", 150_000_000),
                        ("M4A", "audio_96355125555.m4a", 10_300_000)])
+# Training's nested sub-departments: one 1:1 trainee session and one group session,
+# both written exactly as the bucket does (department = TWO leading segments).
+DEMO_RECORDS += _mk_c("Training/Resume-Based", "Vivek_Parmar", "Khushali_Prasad",
+                      "2026-04-01", "Time-11-00-AM-IST", "8898177914",
+                      [("M4A", "a1ac24ce-7bad-4b0e-9663-906dc2bdf0c9.m4a", 197_000),
+                       ("TRANSCRIPT", "transcript_8898177914.vtt", 44_800)])
+DEMO_RECORDS += _mk_c("Training/Advanced", "Rahul_Verma",
+                      "700758300_Nandini_K-Ram_Reddy-Syed_Faraaz",
+                      "2026-04-03", "Time-6-30-PM-IST", "700758300",
+                      [("MP4", "rec_700758300.mp4", 312_000_000),
+                       ("TRANSCRIPT", "transcript_700758300.vtt", 96_500)])
 
 
 def _demo_bytes(rec: dict) -> bytes:

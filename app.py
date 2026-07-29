@@ -87,12 +87,13 @@ def _current_access():
     an optional per-department host restriction ({dept: [host, …]} — no entry
     means every host in that department) and whether they may download (vs
     view-only). Admins get every department, every host and full download rights."""
+    known = s3_service.all_departments()   # configured + auto-discovered
     if session.get("role") == "admin":
-        return {"departments": list(s3_service.DEPARTMENTS), "hosts": {}, "can_download": True}
+        return {"departments": list(known), "hosts": {}, "can_download": True}
     info = auth.user_access(session.get("user", ""))
     # Intersect with the departments that actually exist, so a stale grant can't
     # widen access if a department is renamed/removed in config.
-    depts = [d for d in info["departments"] if d in s3_service.DEPARTMENTS]
+    depts = [d for d in info["departments"] if d in known]
     hosts = {d: hs for d, hs in (info.get("hosts") or {}).items() if d in depts and hs}
     return {"departments": depts, "hosts": hosts, "can_download": bool(info["can_download"])}
 
@@ -141,17 +142,36 @@ def _recordings_unlocked() -> bool:
     return session.get("role") == "admin" or bool(session.get("camera_ok"))
 
 
+class _BadDepartments(ValueError):
+    """An admin-supplied department list contained names the portal doesn't know."""
+
+
 def _clean_departments(raw):
-    """Keep only known department names from an admin-supplied list (drops typos /
-    anything not in DEPARTMENTS)."""
+    """Validate an admin-supplied department list against the known vocabulary
+    (configured + auto-discovered).
+
+    Raises rather than silently dropping unknown names: quietly returning a
+    shorter list would answer {"ok": true} while stripping the user's access —
+    which is exactly what would happen to a Training/* sub-department submitted
+    while the index is still warming."""
+    if raw is None:
+        return []                      # key omitted entirely -> grant nothing
     if not isinstance(raw, list):
-        return []
-    valid = set(s3_service.DEPARTMENTS)
-    seen, out = set(), []
+        raise _BadDepartments("Departments must be a list.")
+    valid = set(s3_service.all_departments())
+    seen, out, unknown = set(), [], []
     for d in raw:
-        if d in valid and d not in seen:
+        if d not in valid:
+            if d not in unknown:
+                unknown.append(str(d))
+        elif d not in seen:
             seen.add(d)
             out.append(d)
+    if unknown:
+        raise _BadDepartments(
+            "Unknown department(s): " + ", ".join(unknown[:10])
+            + ". If one was just created in S3, refresh the index and try again."
+        )
     return out
 
 
@@ -540,7 +560,7 @@ def api_users_list():
     return jsonify({
         "admins": sorted(auth.get_admins().keys(), key=str.lower),
         "users": auth.list_users(),
-        "departments": list(s3_service.DEPARTMENTS),
+        "departments": s3_service.all_departments(),
         "hosts_by_department": opts.get("hosts_by_department", {}),
     })
 
@@ -553,7 +573,10 @@ def api_users_create():
         return jsonify({"error": "Request body must be a JSON object."}), 400
     if data is None:
         data = {}
-    departments = _clean_departments(data.get("departments"))
+    try:
+        departments = _clean_departments(data.get("departments"))
+    except _BadDepartments as e:
+        return jsonify({"error": str(e)}), 400
     try:
         auth.create_user(
             data.get("username", ""), data.get("password", ""),
@@ -582,7 +605,10 @@ def api_users_update(username):
         return jsonify({"error": "Request body must be a JSON object."}), 400
     if data is None:
         data = {}
-    departments = _clean_departments(data.get("departments")) if "departments" in data else None
+    try:
+        departments = _clean_departments(data["departments"]) if "departments" in data else None
+    except _BadDepartments as e:
+        return jsonify({"error": str(e)}), 400
     hosts = None
     if "hosts" in data:
         # Validate against the departments being set now, or the user's current

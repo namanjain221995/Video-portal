@@ -27,6 +27,38 @@ _lock = threading.Lock()
 # Interview-Success, so that preserves exactly what they could already see.
 LEGACY_DEFAULT_DEPTS = ["Interview-Success"]
 
+# Departments that were split into sub-departments in the bucket. A stored grant
+# naming the old parent is read as a grant for exactly its children, so existing
+# users keep precisely the access they had (the children together cover the whole
+# parent) instead of silently losing it when the parent stops being a department.
+# The same expansion is applied to the per-department host restriction — without
+# it a "Training" host mask would key off a department that no longer exists and
+# so restrict nothing, which would WIDEN access rather than preserve it.
+SPLIT_DEPARTMENTS = {
+    "Training": ["Training/Resume-Based", "Training/Advanced",
+                 "Training/Interview-Readiness", "Training/Other"],
+}
+
+
+def _expand_split(departments, hosts):
+    """Rewrite a stored grant so any split parent is replaced by its children."""
+    if not any(d in SPLIT_DEPARTMENTS for d in departments):
+        return list(departments), dict(hosts)
+    out, seen = [], set()
+    for dept in departments:
+        for name in SPLIT_DEPARTMENTS.get(dept, [dept]):
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    new_hosts = {}
+    for dept, host_list in (hosts or {}).items():
+        for name in SPLIT_DEPARTMENTS.get(dept, [dept]):
+            if name in seen and host_list:
+                # A child may also carry its own entry; keep the union.
+                merged = list(dict.fromkeys(list(new_hosts.get(name, [])) + list(host_list)))
+                new_hosts[name] = merged
+    return out, new_hosts
+
 
 # ── Admins (from .env) ───────────────────────────────────────────────────────
 def get_admins() -> dict:
@@ -63,17 +95,24 @@ def _save_users(users: dict) -> None:
 
 
 def list_users() -> list:
+    """Accounts as the Admin page should show them — i.e. the EFFECTIVE grant, with
+    split parents already expanded, so the ticked boxes match what user_access()
+    actually enforces. Saving a row then rewrites the stored grant in the new
+    vocabulary, which is how a legacy record migrates itself."""
     users = _load_users()
-    return sorted(
-        ({"username": u,
-          "created_at": d.get("created_at"),
-          "created_by": d.get("created_by"),
-          "departments": d.get("departments", list(LEGACY_DEFAULT_DEPTS)),
-          "hosts": d.get("hosts") or {},
-          "can_download": bool(d.get("can_download", True))}
-         for u, d in users.items()),
-        key=lambda x: x["username"].lower(),
-    )
+    out = []
+    for username, rec in users.items():
+        depts, hosts = _expand_split(
+            rec.get("departments", list(LEGACY_DEFAULT_DEPTS)),
+            rec.get("hosts") or {},
+        )
+        out.append({"username": username,
+                    "created_at": rec.get("created_at"),
+                    "created_by": rec.get("created_by"),
+                    "departments": depts,
+                    "hosts": hosts,
+                    "can_download": bool(rec.get("can_download", True))})
+    return sorted(out, key=lambda x: x["username"].lower())
 
 
 def user_access(username: str) -> dict:
@@ -86,8 +125,9 @@ def user_access(username: str) -> dict:
     depts = rec.get("departments")
     if depts is None:
         depts = list(LEGACY_DEFAULT_DEPTS)
-    return {"departments": list(depts),
-            "hosts": dict(rec.get("hosts") or {}),
+    depts, hosts = _expand_split(depts, rec.get("hosts") or {})
+    return {"departments": depts,
+            "hosts": hosts,
             "can_download": bool(rec.get("can_download", True))}
 
 
