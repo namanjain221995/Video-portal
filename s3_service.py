@@ -29,10 +29,17 @@ matches YYYY-MM-DD, the meeting id is the all-digit segment, company is the labe
 just before the date and round the one just after (absent in layout C, which has
 neither).
 
-The module lists everything under Interview-Success/, parses each key into a
-structured record, caches the result (TTL + a shared on-disk index so the 3
-gunicorn workers don't each re-scan S3), and exposes search / filter / download
-helpers on top of that cache.
+Group sessions are the one case where the key is NOT the whole story. Older ones
+hyphen-joined every attendee into the candidate folder; current ones name that
+folder literally "Group" and put the roster in a participants.json next to the
+media folders. That file is the only object whose CONTENT this module reads, and
+only to fill in attendee names for display and search — department and host always
+come from the key, so a roster can never influence who may see a recording.
+
+The module lists everything under each department prefix, parses each key into a
+structured record, attaches any attendee roster, caches the result (TTL + a shared
+on-disk index so the 3 gunicorn workers don't each re-scan S3), and exposes
+search / filter / download helpers on top of that cache.
 
 Set DEMO_MODE=true in .env to run the whole UI locally with bundled sample
 data and no AWS account at all.
@@ -48,6 +55,7 @@ import zipfile
 import tempfile
 import threading
 import mimetypes
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
 from botocore.config import Config
@@ -283,6 +291,41 @@ def _split_candidates(candidate: str) -> list:
             out.append(part)
     return out or [candidate]
 
+
+# ── Name normalisation (one definition shared by indexing and searching) ──────
+# Real rosters are messy: "naman_jain", "naman-jain", "Naman Jain", "563-bhanu_Varshini"
+# (a numeric id glued to the front), "Naman_Sir" (an honorific stuck to the name).
+# Everything is folded to lowercase space-separated words so any of those spellings
+# matches any other, and word ORDER never matters (see _name_matches).
+_TITLE_WORDS = {"sir", "madam", "maam", "mam", "mr", "mrs", "ms", "miss", "dr", "prof"}
+# A leading numeric id: "700758249_", "563-", "12 ". Stripped from the QUERY only —
+# a roster name keeps its id so a pasted "563" still finds that person.
+_LEAD_ID_RE = re.compile(r"^\d+[\s\-_.]+")
+# Apostrophes vanish rather than becoming a split, so "ma'am" folds to the
+# honorific "maam" instead of the two meaningless words "ma" + "am", and
+# "O'Brien" stays one word.
+_APOSTROPHE_RE = re.compile(r"['’ʼ`]")
+_NON_ALNUM_RE = re.compile(r"[^0-9a-zA-Z]+")
+# Distinct names are few (a few thousand hosts/attendees) while _norm_name is called
+# per record per search, so memoising it turns the hot path into a dict hit.
+_norm_cache = {}
+
+
+def _norm_name(value: str) -> str:
+    """Comparable form of a name: no honorifics, single spaces, lowercase.
+    Returns "" when nothing name-like is left."""
+    try:
+        return _norm_cache[value]
+    except (KeyError, TypeError):
+        pass
+    text = _APOSTROPHE_RE.sub("", (value or "").strip())
+    words = [w for w in _NON_ALNUM_RE.sub(" ", text).lower().split()
+             if w and w not in _TITLE_WORDS]
+    result = " ".join(words)
+    if isinstance(value, str) and len(_norm_cache) < 200_000:
+        _norm_cache[value] = result      # benign race: same value either way
+    return result
+
 # Low-cardinality fields are interned so the 50k records don't hold 50k copies of
 # the same ~21 hosts / ~8 file-types / handful of dates — a big per-worker RAM win.
 _INTERN_FIELDS = ("department", "host", "year", "month", "company", "date", "round",
@@ -373,9 +416,97 @@ def _parse_key(key: str, size):
 # ─────────────────────────────────────────────────────────────────────────────
 # Listing + cache (in-process TTL cache backed by a shared on-disk index)
 # ─────────────────────────────────────────────────────────────────────────────
+# ── Attendee rosters (participants.json) ─────────────────────────────────────
+# Group sessions no longer carry attendee names in the folder path: the folder is
+# literally "Group" and the roster lives in a participants.json beside the media
+# folders, e.g.
+#   Training/Advanced/{Host}/{Y}/{M}/Group/{Date}/{Time}/{MeetingID}/participants.json
+# It is the ONLY object whose CONTENT the index reads. Names from it are used for
+# display and search only — department and host always come from the key, never
+# from this file, so a roster can never affect who is allowed to see a recording.
+PARTICIPANTS_FILENAME = "participants.json"
+# A roster is well under 1 KB; the cap stops a mislabelled huge object being read.
+PARTICIPANTS_MAX_BYTES = 256 * 1024
+PARTICIPANTS_WORKERS = max(1, int(os.environ.get("PARTICIPANTS_FETCH_WORKERS", "16")))
+
+
+def _meeting_prefix(key: str) -> str:
+    """The '…/{MeetingID}/' prefix every file of one meeting shares. Media keys end
+    in '{FileType}/{filename}', a roster key ends in just 'participants.json'."""
+    head, _, tail = key.rpartition("/")
+    if tail == PARTICIPANTS_FILENAME:
+        return head + "/"
+    parts = key.rsplit("/", 2)
+    return parts[0] + "/" if len(parts) == 3 else ""
+
+
+def _roster_names(payload) -> list:
+    """Attendee names from a participants.json body, deduped on their normalised
+    form so 'Naman_Jain' and 'naman jain' are not listed twice. Tolerant of shape
+    drift: a plain string entry works as well as {"name": …}, and anything without
+    a letter (a bare id) is skipped."""
+    if not isinstance(payload, dict):
+        return []
+    entries = payload.get("candidates")
+    if not isinstance(entries, list):
+        return []
+    seen, out = set(), []
+    for entry in entries[:500]:
+        name = entry.get("name") if isinstance(entry, dict) else entry
+        if not isinstance(name, str):
+            continue
+        name = name.strip()
+        if not name or not _HAS_LETTER_RE.search(name):
+            continue
+        key = _norm_name(name)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(name)
+    return out
+
+
+def _read_roster(key: str):
+    """(meeting_prefix, names) for one participants.json. Never raises: an
+    unreadable or malformed roster degrades to no names rather than failing the
+    whole bucket scan."""
+    try:
+        obj = _client().get_object(Bucket=BUCKET, Key=key)
+        if (obj.get("ContentLength") or 0) > PARTICIPANTS_MAX_BYTES:
+            return _meeting_prefix(key), []
+        body = obj["Body"].read(PARTICIPANTS_MAX_BYTES + 1)
+        if len(body) > PARTICIPANTS_MAX_BYTES:
+            return _meeting_prefix(key), []
+        return _meeting_prefix(key), _roster_names(json.loads(body))
+    except Exception:
+        return _meeting_prefix(key), []
+
+
+def _attach_rosters(records, roster_keys):
+    """Replace the path-derived attendee list with the real roster wherever a
+    meeting has one. Returns how many meetings were resolved.
+
+    Fetched concurrently because each roster is one small GET and a big bucket has
+    thousands of them; a serial pass would add minutes to every scan."""
+    if not roster_keys:
+        return 0
+    rosters = {}
+    workers = min(PARTICIPANTS_WORKERS, len(roster_keys))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for prefix, names in pool.map(_read_roster, roster_keys):
+            if prefix and names:
+                rosters[prefix] = [sys.intern(n) for n in names]
+    if not rosters:
+        return 0
+    for rec in records:
+        names = rosters.get(_meeting_prefix(rec["key"]))
+        if names:
+            rec["candidates"] = names
+    return len(rosters)
+
+
 def _scan_s3():
     client = _client()
-    records = []
+    records, roster_keys = [], []
     paginator = client.get_paginator("list_objects_v2")
     # List each department folder separately so an unrelated top-level prefix in
     # the bucket can never leak into the index. Nested departments are covered by
@@ -383,16 +514,23 @@ def _scan_s3():
     for dept in _scan_prefixes():
         for page in paginator.paginate(Bucket=BUCKET, Prefix=f"{dept}/"):
             for obj in page.get("Contents", []):
-                rec = _parse_key(obj["Key"], obj.get("Size", 0))
+                key = obj["Key"]
+                # A roster is metadata about the meeting, not a downloadable file:
+                # collect it and keep it out of the searchable record set.
+                if key.rpartition("/")[2] == PARTICIPANTS_FILENAME:
+                    roster_keys.append(key)
+                    continue
+                rec = _parse_key(key, obj.get("Size", 0))
                 if rec:
                     records.append(rec)
+    _attach_rosters(records, roster_keys)
     return records
 
 
 # Bump whenever the record shape or DEPARTMENTS coverage changes: a persisted
 # index with an older schema is rejected, forcing ONE clean re-scan on the first
 # boot after a deploy instead of serving pre-upgrade records for up to INDEX_TTL.
-INDEX_SCHEMA = 3   # 3: nested departments (Training/* split into sub-departments)
+INDEX_SCHEMA = 4   # 3: nested departments; 4: attendee rosters from participants.json
 
 
 def _load_disk_index(max_age):
@@ -510,9 +648,18 @@ def _build_options(records):
     """Distinct values for the (small) server-side dropdowns. Company is now a
     free-text input and file-type is a static category list, so hosts +
     departments remain."""
+    # Meetings whose attendee list came from a participants.json rather than from
+    # the folder name. Surfaced in cache_info so "did the rosters load?" is
+    # answerable from the UI instead of by reading logs the module doesn't write.
+    with_roster = {
+        _meeting_prefix(r["key"])
+        for r in records
+        if r.get("candidates") and r["candidates"] != _split_candidates(r["candidate"])
+    }
     return {
         "hosts":       sorted({r["host"] for r in records}, key=str.lower),
         "departments": sorted({r["department"] for r in records}, key=str.lower),
+        "rosters":     len(with_roster),
     }
 
 
@@ -553,12 +700,14 @@ def is_ready() -> bool:
 
 def cache_info():
     if DEMO_MODE:
-        return {"demo": True, "count": len(DEMO_RECORDS), "age_sec": 0, "ready": True}
+        return {"demo": True, "count": len(DEMO_RECORDS), "age_sec": 0, "ready": True,
+                "rosters": _build_options(DEMO_RECORDS)["rosters"]}
     with _lock:
         ready = _cache["records"] is not None
         age = time.time() - _cache["ts"] if ready else None
         count = len(_cache["records"]) if ready else 0
-    return {"demo": False, "count": count,
+        rosters = (_cache["options"] or {}).get("rosters", 0)
+    return {"demo": False, "count": count, "rosters": rosters,
             "age_sec": round(age) if age is not None else None, "ready": ready}
 
 
@@ -574,32 +723,50 @@ def _records_by_key():
 # Search + filters
 # ─────────────────────────────────────────────────────────────────────────────
 def _cand_tokens(query: str) -> list:
-    """Normalised candidate-search tokens: lowercase, underscores/hyphens read
-    as spaces, so 'sirikonda' or 'akhilendra sirikonda' both hit
+    """Normalised candidate-search tokens. Underscores, hyphens, dots and case
+    all disappear, and an honorific typed by the user ('naman sir') is dropped,
+    so 'sirikonda', 'Akhilendra Sirikonda' and 'sirikonda-akhilendra' all hit
     'Akhilendra_NA_Sirikonda'."""
-    return (query or "").lower().replace("_", " ").replace("-", " ").split()
+    # An id prefix is dropped from the query so pasting a roster entry verbatim
+    # ("563-bhanu_Varshini") searches for the person, not the id.
+    return _norm_name(_LEAD_ID_RE.sub("", (query or "").strip())).split()
 
 
 def _name_matches(toks, name: str) -> bool:
-    n = (name or "").lower().replace("_", " ").replace("-", " ")
-    return all(t in n for t in toks)
+    """Do all query tokens appear in this one person's name?
+
+    Order-independent, so 'jain naman' finds 'Naman_Jain' just like 'naman jain'.
+    Tokens match as substrings, which keeps partial names ('bhanu') working. The
+    query is also tried with its separators removed against the name with its
+    spaces removed, so 'namanjain' finds 'Naman_Jain' — people paste names both
+    glued together and spaced out."""
+    normalized = _norm_name(name)
+    if not normalized:
+        return False
+    if all(t in normalized for t in toks):
+        return True
+    return "".join(toks) in normalized.replace(" ", "")
 
 
 def _match_candidate(toks, rec: dict) -> bool:
-    """True when the query names someone in this recording. In a group session
-    (several attendees in one candidate folder) EVERY token must land inside ONE
-    attendee's name — so 'mohammed reddy' can't match a meeting where Mohammed
-    and Reddy are different people. A query carrying a number (a pasted id like
-    '700758249') falls back to the raw folder name, whose numeric prefix is not
-    an attendee. Single-candidate records keep the old whole-string behaviour
-    (an id prefix like '152026_' stays searchable)."""
+    """True when the query names someone in this recording.
+
+    EVERY token must land inside ONE person's name, so 'mohammed reddy' cannot
+    match a group session where Mohammed and Reddy are two different attendees.
+    The attendee list comes from participants.json when the meeting has one, and
+    otherwise from splitting the candidate folder — this is what lets a search
+    find a trainee inside a "Group" folder that does not carry any names.
+
+    The raw folder is tried as a last resort so a pasted id ('152026_') or a
+    literal folder name stays searchable; for a group that fallback is limited to
+    numeric queries, because the folder holds no single attendee's name."""
     if not toks:
         return True
     cands = rec.get("candidates") or [rec["candidate"]]
-    if len(cands) > 1:
-        if any(_name_matches(toks, c) for c in cands):
-            return True
-        return any(t.isdigit() for t in toks) and _name_matches(toks, rec["candidate"])
+    if any(_name_matches(toks, c) for c in cands):
+        return True
+    if len(cands) > 1 and not any(t.isdigit() for t in toks):
+        return False
     return _name_matches(toks, rec["candidate"])
 
 
@@ -960,6 +1127,22 @@ DEMO_RECORDS += _mk_c("Training/Advanced", "Rahul_Verma",
                       "2026-04-03", "Time-6-30-PM-IST", "700758300",
                       [("MP4", "rec_700758300.mp4", 312_000_000),
                        ("TRANSCRIPT", "transcript_700758300.vtt", 96_500)])
+
+# A group session in the CURRENT shape: the folder is literally "Group" and the
+# attendees come from a participants.json, which is what _attach_rosters does in
+# production. Names mirror a real roster, including the "563-" id prefix.
+_DEMO_GROUP = _mk_c("Training/Advanced", "Sneha_Chaudhary", "Group",
+                    "2026-07-09", "Time-1-27-AM-IST", "97609808470",
+                    [("MP4", "adbc738d-efe4-4fc8-8993-76bb38751025.mp4", 281_000_000),
+                     ("M4A", "audio_97609808470.m4a", 18_400_000),
+                     ("TRANSCRIPT", "transcript_97609808470.vtt", 121_000),
+                     ("CHAT", "chat_97609808470.txt", 4_120)])
+_DEMO_ROSTER = ["563-bhanu_Varshini", "Khaja_Faizan", "Mani", "Mohammed_Farhan_Wajid",
+                "Mohammed_Obaid_Ahmed", "Pavithran_Gnanasekaran", "Ruthura_Meedimale",
+                "Vidya_Nomula"]
+for _rec in _DEMO_GROUP:
+    _rec["candidates"] = [sys.intern(n) for n in _DEMO_ROSTER]
+DEMO_RECORDS += _DEMO_GROUP
 
 
 def _demo_bytes(rec: dict) -> bytes:
