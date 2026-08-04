@@ -11,6 +11,9 @@
  *      is open, warns the user, and reports the signal to the audit log,
  *   4. best-effort clears the clipboard after PrintScreen.
  * Admins are fully exempt: no watermark, no warnings, nothing logged.
+ *
+ * This layer NEVER accesses the camera and never captures an image of anyone.
+ * A capture signal produces an audit-log row only.
  */
 (function () {
   "use strict";
@@ -20,45 +23,8 @@
   if (root.getAttribute("data-is-admin") === "true") return;   // admins exempt
 
   var username = root.getAttribute("data-username") || "user";
-  var webcamCapture = root.getAttribute("data-webcam-capture") === "true";
-  var cameraEnrolled = root.getAttribute("data-camera-ok") === "true";
   var previewModal = document.getElementById("preview-modal");
   var watermarkLayer = document.getElementById("watermark-layer");
-
-  // ── webcam snapshot (on-demand: light blinks on, one frame, released) ───────
-  function ensureShot() {
-    return new Promise(function (resolve) {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        resolve(null); return;                 // no camera / insecure origin (http)
-      }
-      navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 }, audio: false })
-        .then(function (stream) {
-          var video = document.createElement("video");
-          video.muted = true;
-          video.playsInline = true;
-          video.srcObject = stream;
-          var done = false;
-          function finish(dataUrl) {
-            if (done) return;
-            done = true;
-            try { stream.getTracks().forEach(function (t) { t.stop(); }); } catch (e) {}
-            resolve(dataUrl);
-          }
-          video.play().catch(function () {});
-          // Give the sensor a moment to expose, then grab a single frame.
-          setTimeout(function () {
-            try {
-              var w = video.videoWidth || 640, h = video.videoHeight || 480;
-              var canvas = document.createElement("canvas");
-              canvas.width = w; canvas.height = h;
-              canvas.getContext("2d").drawImage(video, 0, 0, w, h);
-              finish(canvas.toDataURL("image/jpeg", 0.7));
-            } catch (e) { finish(null); }
-          }, 350);
-        })
-        .catch(function () { resolve(null); });   // denied / unavailable
-    });
-  }
 
   // ── on-screen warning toast ────────────────────────────────────────────────
   var toastTimer = 0;
@@ -86,24 +52,16 @@
     }
     return "";
   }
-  function send(kind, method, photo) {
+  function report(kind, method) {
     try {
       fetch("/api/log/capture", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         cache: "no-store",
         keepalive: true,
-        body: JSON.stringify({ kind: kind, method: method, key: currentPreviewKey(), photo: photo || null })
+        body: JSON.stringify({ kind: kind, method: method, key: currentPreviewKey() })
       }).catch(function () {});
     } catch (e) { /* never let logging break the page */ }
-  }
-  function report(kind, method) {
-    // Grab a webcam photo of whoever triggered it (when the feature is on), then log.
-    if (webcamCapture) {
-      ensureShot().then(function (photo) { send(kind, method, photo); });
-    } else {
-      send(kind, method, null);
-    }
   }
 
   // ── best-effort clipboard overwrite ────────────────────────────────────────
@@ -185,74 +143,5 @@
       attributes: true, attributeFilter: ["style"]
     });
     syncModal();
-  }
-
-  // ── first-use camera enrolment gate ────────────────────────────────────────
-  // Blocks the page until the user allows the camera. The server also refuses
-  // recording bytes until enrolment succeeds, so this is UX on top of enforcement.
-  if (webcamCapture && !cameraEnrolled) {
-    var gate = document.getElementById("camera-gate");
-    var allowBtn = document.getElementById("camera-gate-allow");
-    var statusEl = document.getElementById("camera-gate-status");
-    if (gate && allowBtn) {
-      gate.style.display = "flex";
-      document.body.style.overflow = "hidden";
-
-      function unlock() {
-        gate.style.display = "none";
-        document.body.style.overflow = "";
-        cameraEnrolled = true;
-      }
-      function setStatus(msg, bad) {
-        if (statusEl) {
-          statusEl.textContent = msg || "";
-          statusEl.className = "camera-gate-status" + (bad ? " bad" : "");
-        }
-      }
-      function enrolDenied(reason) {
-        try {
-          fetch("/api/camera/enroll", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            cache: "no-store",
-            body: JSON.stringify({ denied: true, reason: reason || "" })
-          }).catch(function () {});
-        } catch (e) {}
-      }
-
-      allowBtn.addEventListener("click", function () {
-        allowBtn.disabled = true;
-        allowBtn.innerHTML = '<span class="spinner"></span> Checking camera…';
-        setStatus("");
-        ensureShot().then(function (photo) {
-          if (!photo) {
-            enrolDenied("no_camera_or_denied");
-            setStatus("Camera access was blocked or unavailable. Allow the camera in your browser, then try again — recordings stay locked until you do.", true);
-            allowBtn.disabled = false;
-            allowBtn.textContent = "Allow camera & continue";
-            return;
-          }
-          fetch("/api/camera/enroll", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            cache: "no-store",
-            body: JSON.stringify({ photo: photo })
-          }).then(function (r) { return r.json().catch(function () { return {}; }); })
-            .then(function (d) {
-              if (d && d.ok) { unlock(); }
-              else {
-                setStatus((d && d.error) || "Could not verify the camera. Please try again.", true);
-                allowBtn.disabled = false;
-                allowBtn.textContent = "Allow camera & continue";
-              }
-            })
-            .catch(function () {
-              setStatus("Network error verifying the camera. Please try again.", true);
-              allowBtn.disabled = false;
-              allowBtn.textContent = "Allow camera & continue";
-            });
-        });
-      });
-    }
   }
 })();

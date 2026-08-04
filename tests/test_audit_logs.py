@@ -255,68 +255,59 @@ class AuditLogIntegrationTests(unittest.TestCase):
         # Only the admin's own login was added on top of the pre-existing events.
         self.assertEqual(audit_service.list_events()["total"], before + 1)
 
-    def test_webcam_capture_gates_recordings_and_photos_are_admin_only(self):
+    def test_no_camera_access_anywhere_and_capture_reports_store_no_photo(self):
+        """The webcam feature was removed deliberately. Recordings must open with no
+        camera step, the camera endpoints must not exist, and a capture report that
+        still ships a photo payload must be logged WITHOUT storing the image."""
         png = ("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwC"
                "AAAAC0lEQVR42mNk+M8AAAMBAQAY3Y2wAAAAAElFTkSuQmCC")
-        captures = os.path.join(_TEMP_DIR.name, "test-captures")
-        with mock.patch.object(portal, "WEBCAM_CAPTURE", True), \
-                mock.patch.object(portal.capture_store, "CAPTURE_DIR", captures):
-            with portal.app.test_client() as admin:
-                self._login_admin(admin)
-                admin.post("/api/admin/users", json={
-                    "username": "camera-gate-user",
-                    "password": "CameraGateUser-1",
-                    "departments": ["Interview-Success"],
-                    "can_download": True,
-                })
-                key = admin.get("/api/search", query_string={
-                    "meeting_id": "96355112813",
-                }).get_json()["results"][0]["key"]
+        with portal.app.test_client() as admin:
+            self._login_admin(admin)
+            admin.post("/api/admin/users", json={
+                "username": "no-camera-user",
+                "password": "NoCameraUser-1",
+                "departments": ["Interview-Success"],
+                "can_download": True,
+            })
+            key = admin.get("/api/search", query_string={
+                "meeting_id": "96355112813",
+            }).get_json()["results"][0]["key"]
 
-            with portal.app.test_client() as user:
-                user.post("/api/login", json={
-                    "username": "camera-gate-user", "password": "CameraGateUser-1",
-                })
-                # Recordings are blocked until the camera is enrolled.
-                self.assertEqual(user.get("/api/view", query_string={"key": key}).status_code, 403)
-                self.assertEqual(user.get("/api/download", query_string={"key": key}).status_code, 403)
-                self.assertEqual(user.post("/api/download/bulk", json={"keys": [key]}).status_code, 403)
+        with portal.app.test_client() as user:
+            user.post("/api/login", json={
+                "username": "no-camera-user", "password": "NoCameraUser-1",
+            })
+            # Recordings open immediately — there is no enrolment gate to clear.
+            self.assertEqual(user.get("/api/view", query_string={"key": key}).status_code, 200)
+            self.assertEqual(user.get("/api/download", query_string={"key": key}).status_code, 200)
+            bulk = user.post("/api/download/bulk", json={"keys": [key]})
+            self.assertEqual(bulk.status_code, 200)
+            bulk.close()   # release the streamed temp-ZIP handle
 
-                # A denial is logged and keeps recordings blocked.
-                denied = user.post("/api/camera/enroll", json={"denied": True, "reason": "blocked"})
-                self.assertEqual(denied.status_code, 200)
-                self.assertFalse(denied.get_json()["ok"])
-                self.assertEqual(user.get("/api/view", query_string={"key": key}).status_code, 403)
+            # The camera endpoints are gone (404 = no such route).
+            self.assertEqual(user.post("/api/camera/enroll", json={"photo": png}).status_code, 404)
+            self.assertEqual(user.get("/api/admin/capture/abc123.jpg").status_code, 404)
 
-                # Enrolment needs a real photo; then recordings unlock.
-                self.assertEqual(user.post("/api/camera/enroll", json={}).status_code, 400)
-                self.assertTrue(user.post("/api/camera/enroll", json={"photo": png}).get_json()["ok"])
-                self.assertEqual(user.get("/api/view", query_string={"key": key}).status_code, 200)
+            # A capture signal is still audited, but any photo payload is ignored.
+            self.assertEqual(user.post("/api/log/capture", json={
+                "kind": "screenshot", "method": "printscreen", "key": key, "photo": png,
+            }).status_code, 200)
 
-                # A capture report stores a webcam photo.
-                self.assertEqual(user.post("/api/log/capture", json={
-                    "kind": "screenshot", "method": "printscreen", "key": key, "photo": png,
-                }).status_code, 200)
+        events = audit_service.list_events(per_page=200)["events"]
+        shot = next(e for e in events if e["action"] == "screenshot"
+                    and e["username"] == "no-camera-user")
+        self.assertEqual(shot["details"]["method"], "printscreen")
+        self.assertNotIn("capture_photo", shot["details"])
 
-                photo_name = next(
-                    event["details"]["capture_photo"]
-                    for event in audit_service.list_events(per_page=100)["events"]
-                    if event["action"] == "camera_enrolled"
-                )
-                # A normal user cannot read capture photos.
-                self.assertEqual(user.get("/api/admin/capture/" + photo_name).status_code, 403)
+        actions = {e["action"] for e in events}
+        self.assertNotIn("camera_enrolled", actions)
+        self.assertNotIn("camera_unavailable", actions)
 
-            with portal.app.test_client() as admin:
-                self._login_admin(admin)
-                photo_response = admin.get("/api/admin/capture/" + photo_name)
-                self.assertEqual(photo_response.status_code, 200)
-                photo_response.close()   # release the streamed file handle
-                self.assertEqual(admin.get("/api/admin/capture/missing00.jpg").status_code, 404)
-                # Admins are exempt from the camera gate.
-                self.assertEqual(admin.get("/api/view", query_string={"key": key}).status_code, 200)
-
-        actions = {e["action"] for e in audit_service.list_events(per_page=100)["events"]}
-        self.assertTrue({"camera_enrolled", "camera_unavailable", "screenshot"}.issubset(actions))
+        # No route in the app mentions the camera, and no photo store module exists.
+        rules = {str(r) for r in portal.app.url_map.iter_rules()}
+        self.assertFalse([r for r in rules if "camera" in r or "capture/" in r], rules)
+        self.assertFalse(hasattr(portal, "capture_store"))
+        self.assertFalse(hasattr(portal, "WEBCAM_CAPTURE"))
 
     def test_download_refresh_user_changes_and_logout_are_recorded(self):
         child_password = "ChildPasswordMustNotBeLogged"

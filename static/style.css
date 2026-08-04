@@ -383,30 +383,6 @@ audio.preview-media { background: transparent; }
 /* Capture events in the admin log */
 .log-action-capture { background: var(--danger-soft); color: #b91c1c; }
 
-/* Webcam capture photo thumbnail in the admin log */
-.capture-photo-link { display: inline-block; margin: 0 0 6px; }
-.capture-thumb {
-  width: 60px; height: 44px; object-fit: cover; border-radius: 6px;
-  border: 1px solid var(--line-2); display: block;
-}
-
-/* First-use camera enrolment gate (full-screen, blocks the page) */
-.camera-gate {
-  position: fixed; inset: 0; z-index: 100;
-  display: flex; align-items: center; justify-content: center; padding: 24px;
-  background: rgba(2, 6, 23, .78);
-}
-.camera-gate-card {
-  width: 100%; max-width: 460px; background: var(--panel);
-  border-radius: var(--radius); box-shadow: var(--shadow); padding: 30px 28px; text-align: center;
-}
-.camera-gate-icon { font-size: 40px; margin-bottom: 8px; }
-.camera-gate-card h2 { margin: 0 0 10px; font-size: 20px; }
-.camera-gate-card p { margin: 0 0 12px; color: var(--ink-soft); font-size: 14px; line-height: 1.55; }
-.camera-gate-note { font-weight: 600; color: var(--ink); }
-.camera-gate-status { min-height: 18px; margin: 6px 0 14px; font-size: 13px; color: var(--ink-soft); }
-.camera-gate-status.bad { color: #b91c1c; font-weight: 600; }
-
 @media (max-width: 760px) {
   .filters { grid-template-columns: 1fr 1fr; }
   .grid-2 { grid-template-columns: 1fr; }

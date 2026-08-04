@@ -17,9 +17,7 @@
 </header>
 
 <main class="container" data-anti-capture
-      data-username="{{ username }}" data-is-admin="{{ 'true' if is_admin else 'false' }}"
-      data-webcam-capture="{{ 'true' if webcam_capture else 'false' }}"
-      data-camera-ok="{{ 'true' if camera_ok else 'false' }}">
+      data-username="{{ username }}" data-is-admin="{{ 'true' if is_admin else 'false' }}">
   <div class="page-head">
     <div>
       <h1>Search recordings</h1>
@@ -135,22 +133,6 @@
       <button class="btn btn-ghost btn-sm" id="preview-close" type="button">✕ Close</button>
     </div>
     <div class="modal-body" id="preview-body"></div>
-  </div>
-</div>
-
-<!-- Camera enrolment gate (shown only when webcam capture is enabled and the user
-     is a non-admin who hasn't enrolled this session). -->
-<div class="camera-gate" id="camera-gate" role="dialog" aria-modal="true" style="display:none;">
-  <div class="camera-gate-card">
-    <div class="camera-gate-icon">📷</div>
-    <h2>Camera check required</h2>
-    <p>To protect confidential recordings, this portal takes a webcam photo if a
-       screenshot or screen-recording attempt is detected while you view a recording.
-       Your activity and any captured photos are visible to administrators.</p>
-    <p class="camera-gate-note">Please allow camera access to continue. You can’t open
-       recordings until you do.</p>
-    <div id="camera-gate-status" class="camera-gate-status" role="status"></div>
-    <button class="btn btn-primary btn-block" id="camera-gate-allow" type="button">Allow camera &amp; continue</button>
   </div>
 </div>
 

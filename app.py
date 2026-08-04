@@ -24,17 +24,13 @@ from flask import (
 import auth
 import audit_service
 import s3_service
-import capture_store
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-only-change-me")
-# Bumped from tiny key-lists so a base64 webcam snapshot fits in a capture report.
-app.config["MAX_CONTENT_LENGTH"] = 8 * 1024 * 1024
-
-# Webcam capture-on-suspected-leak. OFF by default: it requires HTTPS (browsers
-# block camera access on http://), so enabling it on a plain-HTTP deployment would
-# lock every non-admin user out of recordings. Turn it on only once TLS is in place.
-WEBCAM_CAPTURE = os.environ.get("WEBCAM_CAPTURE", "false").strip().lower() in ("1", "true", "yes")
+# The largest legitimate body is the bulk-download key list: BULK_ZIP_MAX_FILES
+# (250 by default) S3 keys at ~130 bytes each ≈ 33 KB. 1 MiB leaves ~30x headroom
+# even if that limit is raised, while still bounding a hostile request.
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
 
 @app.context_processor
@@ -132,16 +128,6 @@ def _audit(action, record=None, details=None, username=None, role=None,
     return audit_service.record_event(action, **payload)
 
 
-def _recordings_unlocked() -> bool:
-    """Whether the caller may reach actual recording bytes (view/download/zip).
-    When webcam capture is enabled, non-admins must complete camera enrolment
-    first; admins are always unlocked, and the whole gate is a no-op when the
-    feature is off."""
-    if not WEBCAM_CAPTURE:
-        return True
-    return session.get("role") == "admin" or bool(session.get("camera_ok"))
-
-
 class _BadDepartments(ValueError):
     """An admin-supplied department list contained names the portal doesn't know."""
 
@@ -221,8 +207,6 @@ def search_page():
         username=session.get("user"),
         is_admin=session.get("role") == "admin",
         demo=s3_service.DEMO_MODE,
-        webcam_capture=WEBCAM_CAPTURE,
-        camera_ok=bool(session.get("camera_ok")),
     )
 
 
@@ -382,8 +366,6 @@ def api_refresh():
 def api_download_one():
     key = request.args.get("key", "")
     access = _current_access()
-    if not _recordings_unlocked():
-        abort(403, "Camera access is required before opening recordings.")
     if not access["can_download"]:
         abort(403, "Your account is view-only — downloads are disabled.")
     rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
@@ -415,8 +397,6 @@ def api_view_one():
     including view-only accounts that may not use /api/download."""
     key = request.args.get("key", "")
     access = _current_access()
-    if not _recordings_unlocked():
-        abort(403, "Camera access is required before opening recordings.")
     rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
     if rec is None:
         abort(404, "File not found.")
@@ -464,8 +444,6 @@ def api_view_one():
 @login_required
 def api_download_bulk():
     access = _current_access()
-    if not _recordings_unlocked():
-        return jsonify({"error": "Camera access is required before downloading recordings."}), 403
     if not access["can_download"]:
         return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
     data = request.get_json(silent=True)
@@ -717,16 +695,6 @@ def api_log_capture():
     if isinstance(method, str) and method.strip():
         details["method"] = method.strip()[:64]
 
-    # Optional webcam snapshot of whoever triggered the capture attempt.
-    if WEBCAM_CAPTURE:
-        photo = capture_store.save_data_url(data.get("photo"))
-        if photo:
-            details["capture_photo"] = photo
-            try:
-                capture_store.purge_old()
-            except Exception:
-                pass
-
     rec, extra = None, {}
     key = data.get("key")
     if isinstance(key, str) and key:
@@ -736,42 +704,6 @@ def api_log_capture():
             extra["resource_key"] = key            # per-recording dedupe
     _audit(kind, record=rec, details=details, dedupe_seconds=10, **extra)
     return jsonify({"ok": True})
-
-
-@app.route("/api/camera/enroll", methods=["POST"])
-@login_required
-def api_camera_enroll():
-    """First-use webcam check. On success the session is marked camera-enrolled and
-    recordings unlock; a denial is logged and recordings stay blocked. Admins and
-    the feature-off case unlock immediately with nothing captured."""
-    if not WEBCAM_CAPTURE or session.get("role") == "admin":
-        session["camera_ok"] = True
-        return jsonify({"ok": True, "required": False})
-
-    data = request.get_json(silent=True) or {}
-    if data.get("denied"):
-        _audit("camera_unavailable", success=False,
-               details={"reason": str(data.get("reason") or "")[:120]})
-        return jsonify({"ok": False, "required": True})
-
-    photo = capture_store.save_data_url(data.get("photo"))
-    if not photo:
-        return jsonify({"error": "A camera photo is required to continue."}), 400
-    session["camera_ok"] = True
-    _audit("camera_enrolled", details={"capture_photo": photo})
-    return jsonify({"ok": True, "required": True})
-
-
-@app.route("/api/admin/capture/<name>")
-@admin_required
-def api_capture_photo(name):
-    """Serve a stored capture photo to admins only (strict basename validation)."""
-    path = capture_store.path_for(name)
-    if not path:
-        abort(404)
-    resp = send_file(path, max_age=0)
-    resp.headers["Cache-Control"] = "no-store, private"
-    return resp
 
 
 # ─────────────────────────────────────────────────────────────────────────────

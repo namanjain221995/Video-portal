@@ -26,8 +26,6 @@
     logs_cleared: "Cleared all logs",
     screenshot: "Screenshot",
     screen_capture_suspected: "Possible screen capture",
-    camera_enrolled: "Camera enrolled",
-    camera_unavailable: "Camera denied / unavailable",
   };
 
   const DETAIL_LABELS = {
@@ -113,8 +111,7 @@
     if (key === "search") return "search";
     if (key === "view" || key.includes("preview") || key.includes("view")) return "view";
     if (key.includes("download")) return "download";
-    if (key === "screenshot" || key === "screen_capture_suspected" ||
-        key === "camera_enrolled" || key === "camera_unavailable") return "capture";
+    if (key === "screenshot" || key === "screen_capture_suspected") return "capture";
     if (key.startsWith("user_") || key === "logs_cleared") return "admin";
     if (key === "refresh") return "refresh";
     return "other";
@@ -226,7 +223,8 @@
     }
     Object.keys(value).forEach((key) => {
       if (entries.length >= 40 || isSensitiveKey(key) || key === "items" || key === "recordings") return;
-      if (key === "capture_photo") return;   // rendered as a thumbnail, not text
+      if (key === "capture_photo") return;   // legacy field: webcam capture is gone,
+                                             // so old rows' photo names are suppressed
       if (REPEATED_DETAIL_KEYS.has(String(key).toLowerCase())) return;
       const nextPath = path ? `${path}.${key}` : key;
       flattenDetails(value[key], nextPath, entries, depth + 1);
@@ -261,16 +259,6 @@
     return `<details class="log-bulk-items"><summary>${items.length.toLocaleString()} recording${items.length === 1 ? "" : "s"}</summary><ol>${rows}</ol></details>`;
   }
 
-  function capturePhotoHtml(details) {
-    if (!details || typeof details !== "object" || Array.isArray(details)) return "";
-    const name = details.capture_photo;
-    if (!name || typeof name !== "string") return "";
-    const src = "/api/admin/capture/" + encodeURIComponent(name);
-    return `<a class="capture-photo-link" href="${esc(src)}" target="_blank" rel="noopener" ` +
-      `title="Open full-size capture photo"><img class="capture-thumb" src="${esc(src)}" ` +
-      `alt="Webcam capture" loading="lazy"></a>`;
-  }
-
   function renderDetails(event) {
     const details = parseDetails(event.details);
     const entries = [];
@@ -293,8 +281,7 @@
     const renderedEntries = entries.map((entry) =>
       `<div class="log-detail"><span>${esc(entry.label)}</span>${esc(entry.value)}</div>`
     );
-    let html = capturePhotoHtml(details);
-    html += renderedEntries.slice(0, 3).join("");
+    let html = renderedEntries.slice(0, 3).join("");
     if (renderedEntries.length > 3) {
       html += `<details class="log-more-details"><summary>+${(renderedEntries.length - 3).toLocaleString()} more</summary>${renderedEntries.slice(3).join("")}</details>`;
     }

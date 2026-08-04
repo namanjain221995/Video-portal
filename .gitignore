@@ -2,7 +2,6 @@
 users.json
 audit.db
 audit.db-*
-captures/
 __pycache__/
 *.pyc
 *.zip
