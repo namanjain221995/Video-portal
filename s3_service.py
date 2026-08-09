@@ -141,7 +141,7 @@ _ROOT_DEPTH = len([p for p in ROOT_PREFIX.split("/") if p])
 
 _lock = threading.Lock()          # guards _cache reads/writes (fast)
 _scan_lock = threading.Lock()     # serialises (re)builds so we never scan twice at once
-_cache = {"records": None, "by_key": None, "options": None, "ts": 0.0}
+_cache = {"records": None, "by_key": None, "by_meeting": None, "options": None, "ts": 0.0}
 # Departments seen in any index this process has held (guarded by _lock). Grows
 # only — see the note in _store() for why a department must not become unknown
 # again once discovered.
@@ -202,10 +202,55 @@ _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # Some departments insert a "Time-8-30-PM-IST" folder where Interview-Success has
 # a Round. It must never be read as a company or round.
 _TIME_RE = re.compile(r"^time-.*ist$", re.I)
+_TIME_SPLIT_RE = re.compile(r"[-_.\s]+")
+_MERIDIEM = ("am", "pm")
+# The time folders are written by the Zoom automation in Indian Standard Time, so
+# a parsed clock time is IST unless the folder itself says otherwise. The portal
+# stores that source zone on every record and converts for display in the browser.
+DEFAULT_TIME_ZONE = "IST"
 
 
 def _is_time(s: str) -> bool:
     return bool(_TIME_RE.match(s or ""))
+
+
+def _parse_time_folder(segment: str):
+    """(canonical "HH:MM", zone) for a "Time-8-30-PM-IST" folder, else ("", "").
+
+    Tolerant of every shape the bucket actually contains — "Time-11-00-AM-IST",
+    "Time-1-27-AM-IST" and the abbreviated "Time-6-IST" (hour only, no meridiem).
+    Anything it cannot read confidently degrades to "no time" rather than to a
+    wrong one: an empty Time column is honest, a fabricated 00:00 is not."""
+    if not _is_time(segment):
+        return "", ""
+    parts = [p for p in _TIME_SPLIT_RE.split(segment)[1:] if p]   # drop the "Time" prefix
+    if not parts:
+        return "", ""
+    zone = parts.pop().upper()                      # trailing IST (guaranteed by _is_time)
+    meridiem = parts.pop().lower() if parts and parts[-1].lower() in _MERIDIEM else ""
+    if not parts or not parts[0].isdigit():
+        return "", ""
+    hour = int(parts[0])
+    minute = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+    if meridiem:
+        if not 1 <= hour <= 12:
+            return "", ""
+        hour = hour % 12 + (12 if meridiem == "pm" else 0)
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        return "", ""
+    return "%02d:%02d" % (hour, minute), zone
+
+
+def _time_of_key(key: str):
+    """(time, zone) for a whole key — the fallback used to backfill a record that
+    was parsed before times were indexed. _parse_key scans only the segments
+    between the candidate and the file-type folder, which is where a real Time
+    folder always sits."""
+    for segment in (key or "").split("/"):
+        time_of_day, zone = _parse_time_folder(segment)
+        if time_of_day:
+            return time_of_day, zone
+    return "", ""
 
 
 # ── Department resolution (supports nested entries like "Training/Resume-Based") ──
@@ -329,10 +374,15 @@ def _norm_name(value: str) -> str:
 # Low-cardinality fields are interned so the 50k records don't hold 50k copies of
 # the same ~21 hosts / ~8 file-types / handful of dates — a big per-worker RAM win.
 _INTERN_FIELDS = ("department", "host", "year", "month", "company", "date", "round",
-                  "file_type", "category", "ext")
+                  "time", "time_zone", "file_type", "category", "ext")
 
 
 def _intern_rec(d: dict) -> dict:
+    # Records read from a disk index written before times were indexed have no
+    # "time" — recover it from the key so a stale index degrades to a slower load
+    # rather than to a blank Time column. (The schema bump normally rebuilds first.)
+    if "time" not in d:
+        d["time"], d["time_zone"] = _time_of_key(d.get("key", ""))
     for k in _INTERN_FIELDS:
         v = d.get(k)
         if isinstance(v, str):
@@ -392,6 +442,14 @@ def _parse_key(key: str, size):
         if nxt and not nxt.isdigit() and not _is_time(nxt):
             rnd = nxt
     meeting_id = next((s for s in mid if s.isdigit()), "")
+    # The same Time folder that must never be read as a company or round IS the
+    # meeting's start time — the only clock reading the layout carries. Layout A
+    # (Interview-Success, 10 segments) has no such folder, so time stays "".
+    time_of_day, time_zone = "", ""
+    for s in mid:
+        time_of_day, time_zone = _parse_time_folder(s)
+        if time_of_day:
+            break
 
     return _intern_rec({
         "department": department,
@@ -402,6 +460,8 @@ def _parse_key(key: str, size):
         "candidates": _split_candidates(candidate),   # people in the meeting (1+)
         "company":    company,
         "date":       date,
+        "time":       time_of_day,                     # "HH:MM" in time_zone, or ""
+        "time_zone":  time_zone or (DEFAULT_TIME_ZONE if time_of_day else ""),
         "round":      rnd,
         "meeting_id": meeting_id,
         "file_type":  file_type,                       # corrected raw folder (MP4/CC/docs…)
@@ -530,7 +590,7 @@ def _scan_s3():
 # Bump whenever the record shape or DEPARTMENTS coverage changes: a persisted
 # index with an older schema is rejected, forcing ONE clean re-scan on the first
 # boot after a deploy instead of serving pre-upgrade records for up to INDEX_TTL.
-INDEX_SCHEMA = 4   # 3: nested departments; 4: attendee rosters from participants.json
+INDEX_SCHEMA = 5   # 3: nested departments; 4: attendee rosters; 5: meeting start time
 
 
 def _load_disk_index(max_age):
@@ -617,12 +677,24 @@ def _rebuild_from_s3(force):
     return recs
 
 
+def _group_by_meeting(records):
+    """{meeting_prefix: [record, …]} — every file that belongs to one meeting.
+    Built once per index so a sibling lookup (e.g. "which caption file goes with
+    this video?") is a dict hit instead of a scan over every record."""
+    by_meeting = {}
+    for r in records:
+        by_meeting.setdefault(_meeting_prefix(r["key"]), []).append(r)
+    return by_meeting
+
+
 def _store(records):
     options = _build_options(records)
     by_key = {r["key"]: r for r in records}
+    by_meeting = _group_by_meeting(records)
     with _lock:
         _cache["records"] = records
         _cache["by_key"] = by_key
+        _cache["by_meeting"] = by_meeting
         _cache["options"] = options
         _cache["ts"] = time.time()
         # Remember every department ever seen in this process. An auto-discovered
@@ -717,6 +789,14 @@ def _records_by_key():
     get_records()  # ensure cache is fresh (handles TTL/cold start)
     with _lock:
         return _cache["by_key"] or {}
+
+
+def _records_by_meeting():
+    if DEMO_MODE:
+        return _group_by_meeting(DEMO_RECORDS)
+    get_records()  # ensure cache is fresh (handles TTL/cold start)
+    with _lock:
+        return _cache["by_meeting"] or {}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -821,18 +901,50 @@ def filter_options(departments=None, allowed_hosts=None, block: bool = False):
 
 # User-selectable sort orders. Applied as a stable re-sort on top of the default
 # (department, candidate, date…) tuple, so equal keys keep a deterministic order.
+# The date sorts key on (date, time) so two recordings from the same day are
+# ordered by when they actually happened rather than arbitrarily.
 _SORTS = {
-    "date_desc": (lambda r: r["date"], True),
-    "date_asc":  (lambda r: r["date"], False),
+    "date_desc": (lambda r: (r["date"], r.get("time") or ""), True),
+    "date_asc":  (lambda r: (r["date"], r.get("time") or ""), False),
     "size_desc": (lambda r: r["size"], True),
     "size_asc":  (lambda r: r["size"], False),
     "candidate": (lambda r: r["candidate"].lower(), False),
 }
 
 
+def _category_filter(file_type):
+    """The set of categories a file-type filter selects, from a single value, a
+    comma-separated string or a list — so the multi-select UI, an older
+    single-value client and a direct caller all share one code path.
+
+    Unrecognised values are deliberately KEPT: an unknown category then matches
+    nothing, exactly as a single bogus value always did. Dropping it would silently
+    turn a typo'd filter into "no filter at all" and return the whole corpus."""
+    if isinstance(file_type, str):
+        raw = file_type.split(",")
+    elif isinstance(file_type, (list, tuple, set)):
+        raw = [piece for item in file_type if isinstance(item, str) for piece in item.split(",")]
+    else:
+        raw = []
+    out = []
+    for value in raw:
+        value = value.strip().lower()
+        if value and value not in out:
+            out.append(value)
+    return out
+
+
+def _clean_iso_date(value):
+    """A YYYY-MM-DD bound for the date-range filter, or "" for anything else.
+    Partial input ("2026-06") is not a bound — it belongs in the free-text `date`
+    filter, which already matches a whole month as a substring."""
+    value = (value or "").strip()
+    return value if _DATE_RE.match(value) else ""
+
+
 def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
-           department="", allowed_departments=None, allowed_hosts=None,
-           limit=None, offset=0, sort=""):
+           department="", date_from="", date_to="", allowed_departments=None,
+           allowed_hosts=None, limit=None, offset=0, sort=""):
     """Filter the index. Returns (rows, total, total_size) where rows is the
     `offset:offset+limit` page (limit defaults to RESULT_LIMIT) of the sorted
     match set, while total/total_size reflect the FULL match set.
@@ -845,6 +957,12 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     param can never widen access. `department` is an optional user-chosen
     narrowing within that allowed set.
 
+    `file_type` accepts SEVERAL categories at once ("video,audio" or a list), and
+    `date_from`/`date_to` are an inclusive YYYY-MM-DD range — either bound alone is
+    open-ended, and both set to the same day is a single-day filter. The range
+    combines with the free-text `date` (which still matches a partial value such as
+    a whole month) rather than replacing it.
+
     Empty query short-circuits to ([], 0, 0) WITHOUT touching S3 — so landing the
     page (or a blank submit) never scans or serialises the whole bucket. The access
     mask is NOT counted as a query, so a blank submit still returns nothing."""
@@ -852,15 +970,20 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     company    = (company or "").strip().lower()
     date       = (date or "").strip().lower()
     meeting_id = (meeting_id or "").strip().lower()
-    file_type  = (file_type or "").strip().lower()   # a category key (video/audio/…)
     host       = (host or "").strip().lower()
     department = (department or "").strip()
+    categories = set(_category_filter(file_type))    # category keys (video/audio/…)
+    date_from  = _clean_iso_date(date_from)
+    date_to    = _clean_iso_date(date_to)
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from      # a reversed range is still a range
     # Tokenise up front: separator-only input ('-', '_') yields no tokens and must
     # count as NO query, or it would slip past the blank-submit guard and dump the
     # caller's whole allowed corpus.
     cand_toks = _cand_tokens(candidate)
 
-    if not any([cand_toks, company, date, meeting_id, file_type, host, department]):
+    if not any([cand_toks, company, date, date_from, date_to, meeting_id,
+                categories, host, department]):
         return [], 0, 0
 
     allowed = set(allowed_departments) if allowed_departments is not None else None
@@ -879,15 +1002,26 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
             continue
         if date and date not in r["date"].lower():              # "2026-06" matches a month
             continue
+        if date_from or date_to:
+            # ISO dates compare correctly as strings. An undated recording cannot
+            # be placed inside a range, so it is excluded rather than assumed in.
+            rec_date = r["date"]
+            if not rec_date:
+                continue
+            if date_from and rec_date < date_from:
+                continue
+            if date_to and rec_date > date_to:
+                continue
         if meeting_id and meeting_id not in r["meeting_id"].lower():
             continue
-        if file_type and file_type != r["category"]:            # canonical category
+        if categories and r["category"] not in categories:      # canonical categories
             continue
         if host and host != r["host"].lower():
             continue
         out.append(r)
 
-    out.sort(key=lambda r: (r["department"].lower(), r["candidate"].lower(), r["date"], r["meeting_id"], r["file_type"]))
+    out.sort(key=lambda r: (r["department"].lower(), r["candidate"].lower(), r["date"],
+                            r.get("time") or "", r["meeting_id"], r["file_type"]))
     if sort in _SORTS:
         keyf, rev = _SORTS[sort]
         out.sort(key=keyf, reverse=rev)   # stable → the tuple above breaks ties
@@ -916,6 +1050,28 @@ def record_for_key(key: str):
     if not key:
         return None
     return _records_by_key().get(key)
+
+
+# Subtitle formats a browser <track> can render. Zoom writes WebVTT for both the
+# TRANSCRIPT and the CC (closed captions) folder, which is what makes captions on
+# the video preview possible without converting anything.
+CAPTION_EXTS = ("vtt",)
+
+
+def caption_records(key: str):
+    """Caption files that belong to the SAME meeting as `key` — the transcript /
+    closed-caption track Zoom writes next to the recording.
+
+    Lookup only: the returned records still have to be authorized by the caller,
+    exactly like any other key. They always share the meeting folder of `key`, so
+    they can only ever be in the same department, but re-checking keeps the access
+    decision in one place instead of relying on that."""
+    prefix = _meeting_prefix(key)
+    if not prefix:
+        return []
+    siblings = [r for r in _records_by_meeting().get(prefix, [])
+                if r["ext"] in CAPTION_EXTS and r["key"] != key]
+    return sorted(siblings, key=lambda r: (r["file_type"].lower(), r["filename"].lower()))
 
 
 def key_allowed(key: str, allowed_departments, allowed_hosts=None) -> bool:

@@ -21,7 +21,13 @@
   --warn-soft: #fffbeb;
   --shadow:    0 10px 30px rgba(2, 6, 23, .12);
   --radius:    14px;
+  /* Page width. Forms-first pages (login, admin) read better narrow; the pages
+     built around a wide table opt into --page-max via <body class="page-wide">,
+     which keeps the header aligned with the content it sits above. */
+  --page-max:  1200px;
 }
+
+body.page-wide { --page-max: 1760px; }
 
 * { box-sizing: border-box; }
 
@@ -126,7 +132,7 @@ a { color: var(--brand); }
   box-shadow: 0 1px 0 rgba(255,255,255,.05);
 }
 .topbar-inner {
-  max-width: 1200px; margin: 0 auto; padding: 0 22px; height: 60px;
+  max-width: var(--page-max); margin: 0 auto; padding: 0 22px; height: 60px;
   display: flex; align-items: center; gap: 14px;
 }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 16px; }
@@ -146,7 +152,22 @@ a { color: var(--brand); }
 .topbar a.navlink:hover { background: rgba(255,255,255,.08); color: #fff; }
 .topbar a.navlink[aria-current="page"] { background: rgba(255,255,255,.12); color: #fff; }
 
-.container { max-width: 1200px; margin: 0 auto; padding: 26px 22px 60px; }
+.container { max-width: var(--page-max); margin: 0 auto; padding: 26px 22px 60px; }
+
+/* ── Timezone picker (top-right of the header) ─────────────────────────────*/
+.tz-picker {
+  display: inline-flex; align-items: center; gap: 7px; flex-shrink: 0;
+  font-size: 13px; font-weight: 600; color: #cbd5e1; cursor: pointer;
+  padding: 4px 4px 4px 10px; border-radius: 9px; background: rgba(255,255,255,.07);
+}
+.tz-picker .tz-icon { font-size: 13px; line-height: 1; }
+.tz-picker select.input {
+  width: auto; padding: 5px 27px 5px 9px; font-size: 13px; font-weight: 700;
+  background-color: transparent; border-color: rgba(255,255,255,.18); color: #fff;
+  background-position: right 8px center;
+}
+.tz-picker select.input option { color: var(--ink); background: #fff; }
+.tz-picker select.input:focus { border-color: #a5b4fc; box-shadow: none; }
 
 .card {
   background: var(--panel); border: 1px solid var(--line);
@@ -161,8 +182,14 @@ a { color: var(--brand); }
 .page-head p { margin: 4px 0 0; color: var(--ink-soft); font-size: 14px; }
 
 /* ── Search filters grid ───────────────────────────────────────────────────*/
-.filters { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-.filters .field { margin: 0; }
+/* auto-fit rather than a fixed column count: the same rule gives four columns on
+   a wide screen and one on a phone, without a media query per breakpoint. */
+.filters { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 14px; }
+.filters .field { margin: 0; min-width: 0; }
+.field-hint {
+  font-weight: 500; color: var(--muted); text-transform: none; letter-spacing: 0;
+}
+.field-hint::before { content: "· "; }
 .select, .filters .input { width: 100%; }
 select.input { appearance: none;
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
@@ -188,19 +215,36 @@ select.input { appearance: none;
 .summary { font-size: 13.5px; color: var(--ink-soft); }
 .summary strong { color: var(--ink); }
 
-.table-wrap { overflow: auto; max-height: 70vh; border: 1px solid var(--line); border-radius: var(--radius); background: #fff; }
+/* Sized off the viewport instead of a flat 70vh so a tall screen shows more rows
+   and the page itself does not also scroll — the table owns the scrolling. */
+.table-wrap {
+  overflow: auto; max-height: calc(100vh - 330px); min-height: 260px;
+  border: 1px solid var(--line); border-radius: var(--radius); background: #fff;
+}
 table.results { width: 100%; border-collapse: collapse; font-size: 13.5px; }
-table.results th, table.results td { padding: 11px 13px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+table.results th, table.results td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
 table.results thead th {
   background: #f8fafc; color: var(--ink-soft); font-weight: 600; font-size: 12px;
   text-transform: uppercase; letter-spacing: .03em; position: sticky; top: 0; z-index: 1;
 }
 table.results tbody tr:hover { background: #f8fafc; }
 table.results td.candidate { font-weight: 600; }
-table.results td.wrap { white-space: normal; max-width: 260px; }
+table.results td.wrap { white-space: normal; max-width: 240px; }
 table.results tbody tr:last-child td { border-bottom: none; }
 .col-check { width: 38px; text-align: center; }
 .col-check input { width: 16px; height: 16px; accent-color: var(--brand); cursor: pointer; }
+/* Long department / host / company names are truncated with the full value on
+   hover, so one outlier cannot push the whole table into horizontal scrolling. */
+table.results td.col-clip { max-width: 200px; overflow: hidden; text-overflow: ellipsis; }
+table.results td.col-date, table.results td.col-time { font-variant-numeric: tabular-nums; }
+table.results td.col-time { color: var(--ink-soft); }
+.cell-muted { color: var(--muted); }
+.th-zone {
+  font-size: 10px; font-weight: 700; letter-spacing: .04em;
+  color: var(--brand-dk); background: var(--brand-soft);
+  padding: 1px 5px; border-radius: 5px; vertical-align: 1px;
+}
+.zone-hint { font-size: 12.5px; color: var(--warn); font-weight: 600; }
 
 .ft-tag {
   display: inline-block; font-size: 11.5px; font-weight: 700; padding: 2px 8px;
@@ -337,6 +381,96 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 .user-access-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .user-access-actions .perm-select { width: auto; min-width: 150px; padding: 7px 30px 7px 11px; font-size: 13px; }
 
+/* ── Multi-select dropdown (file type) ─────────────────────────────────────*/
+.ms { position: relative; }
+.ms-toggle {
+  display: flex; align-items: center; text-align: left; cursor: pointer;
+  font-family: inherit; font-size: 15px; line-height: 1.25;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='14' height='14' viewBox='0 0 24 24' fill='none' stroke='%2394a3b8' stroke-width='2.5'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 12px center; padding-right: 34px;
+}
+.ms-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+.ms.has-value .ms-summary { color: var(--ink); font-weight: 600; }
+.ms.open .ms-toggle { border-color: var(--brand); box-shadow: 0 0 0 3px rgba(79,70,229,.15); }
+.ms-menu {
+  position: absolute; z-index: 30; top: calc(100% + 6px); left: 0; right: 0; min-width: 220px;
+  background: #fff; border: 1px solid var(--line-2); border-radius: 12px;
+  box-shadow: var(--shadow); overflow: hidden;
+}
+.ms-menu-head {
+  display: flex; gap: 14px; padding: 9px 13px; border-bottom: 1px solid var(--line);
+  background: #f8fafc;
+}
+.ms-link {
+  border: 0; background: none; padding: 0; cursor: pointer; font-family: inherit;
+  font-size: 12px; font-weight: 700; color: var(--brand-dk);
+}
+.ms-link:hover { text-decoration: underline; }
+.ms-menu-body { max-height: 260px; overflow: auto; padding: 5px; }
+.ms-option {
+  display: flex; align-items: center; gap: 9px; padding: 7px 9px; border-radius: 8px;
+  font-size: 13.5px; color: var(--ink); cursor: pointer; user-select: none;
+}
+.ms-option:hover { background: var(--brand-soft); }
+.ms-option input { width: 15px; height: 15px; accent-color: var(--brand); cursor: pointer; margin: 0; }
+
+/* ── Date range picker ─────────────────────────────────────────────────────*/
+.dp-field { position: relative; }
+.dp-field .input { cursor: pointer; }
+.dp-field .input.has-value { font-weight: 600; }
+.dp-pop {
+  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+  display: flex; background: #fff; border: 1px solid var(--line-2);
+  border-radius: 12px; box-shadow: var(--shadow); overflow: hidden;
+}
+.dp-presets {
+  display: flex; flex-direction: column; gap: 2px; padding: 10px;
+  background: #f8fafc; border-right: 1px solid var(--line); min-width: 132px;
+}
+.dp-preset {
+  border: 0; background: none; padding: 7px 9px; border-radius: 7px; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+  text-align: left; white-space: nowrap;
+}
+.dp-preset:hover { background: var(--brand-soft); color: var(--brand-dk); }
+.dp-main { padding: 12px; }
+.dp-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.dp-nav {
+  width: 30px; height: 30px; flex-shrink: 0; border: 1px solid var(--line-2);
+  background: #fff; border-radius: 8px; cursor: pointer;
+  font-size: 16px; line-height: 1; color: var(--ink-soft);
+}
+.dp-nav:hover { background: #f8fafc; }
+.dp-head select {
+  flex: 1; min-width: 0; font-family: inherit; font-size: 13px; font-weight: 600;
+  padding: 6px 8px; border: 1px solid var(--line-2); border-radius: 8px;
+  background: #fff; color: var(--ink); cursor: pointer;
+}
+.dp-week, .dp-days { display: grid; grid-template-columns: repeat(7, 36px); gap: 2px; }
+.dp-week span {
+  text-align: center; font-size: 11px; font-weight: 700; color: var(--muted);
+  padding-bottom: 4px; text-transform: uppercase;
+}
+.dp-day {
+  height: 32px; border: 0; background: none; border-radius: 8px; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; font-weight: 600; color: var(--ink);
+}
+.dp-day:hover { background: var(--brand-soft); }
+.dp-day.is-out { color: var(--muted); font-weight: 500; }
+.dp-day.is-today { box-shadow: inset 0 0 0 1px var(--line-2); }
+.dp-day.is-in { background: var(--brand-soft); border-radius: 0; }
+.dp-day.is-start, .dp-day.is-end, .dp-day.is-pending {
+  background: var(--brand); color: #fff;
+}
+.dp-day.is-start:not(.is-end) { border-radius: 8px 0 0 8px; }
+.dp-day.is-end:not(.is-start) { border-radius: 0 8px 8px 0; }
+.dp-foot {
+  display: flex; align-items: center; gap: 8px;
+  margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);
+}
+.dp-foot .dp-spacer { flex: 1; }
+.dp-sel { font-size: 12px; color: var(--ink-soft); font-weight: 600; }
+
 /* ── Preview modal (view-in-browser) ────────────────────────────────────────*/
 .modal-backdrop {
   position: fixed; inset: 0; z-index: 50;
@@ -362,6 +496,29 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 .modal-body .empty { color: var(--muted); }
 .preview-media { width: 100%; max-height: 70vh; display: block; border-radius: 8px; background: #000; }
 audio.preview-media { background: transparent; }
+/* Captions render inside the video box; keep them legible over a bright frame. */
+.preview-media::cue { background: rgba(2, 6, 23, .78); color: #fff; font-size: .85em; }
+
+/* Player controls the native chrome does not give us: playback speed, and the
+   caption tracks fetched from /api/captions. */
+.player-bar {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px; margin-top: 12px;
+}
+.player-group { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.player-label {
+  font-size: 11px; font-weight: 700; letter-spacing: .05em; text-transform: uppercase;
+  color: #94a3b8;
+}
+.player-btns { display: flex; flex-wrap: wrap; gap: 4px; }
+.player-btn {
+  border: 1px solid rgba(255,255,255,.16); background: rgba(255,255,255,.06);
+  color: #e2e8f0; border-radius: 7px; padding: 5px 10px; cursor: pointer;
+  font-family: inherit; font-size: 12.5px; font-weight: 600; line-height: 1;
+  font-variant-numeric: tabular-nums; transition: background .15s, color .15s;
+}
+.player-btn:hover:not(:disabled) { background: rgba(255,255,255,.14); }
+.player-btn.active { background: var(--brand); border-color: var(--brand); color: #fff; }
+.player-btn:disabled { opacity: .4; cursor: not-allowed; text-decoration: line-through; }
 .preview-frame { width: 100%; height: 65vh; border: 0; border-radius: 8px; background: #fff; }
 .preview-text {
   margin: 0; max-height: 70vh; overflow: auto; white-space: pre-wrap; word-break: break-word;
@@ -386,9 +543,18 @@ audio.preview-media { background: transparent; }
 @media (max-width: 760px) {
   .filters { grid-template-columns: 1fr 1fr; }
   .grid-2 { grid-template-columns: 1fr; }
+  /* The calendar is wider than a phone column: stack the presets above the grid
+     and let the popup break out of its field rather than scroll sideways. */
+  .dp-pop { flex-direction: column; max-width: calc(100vw - 32px); }
+  .dp-presets {
+    flex-direction: row; overflow-x: auto; min-width: 0;
+    border-right: 0; border-bottom: 1px solid var(--line);
+  }
+  .table-wrap { max-height: calc(100vh - 260px); }
 }
 @media (max-width: 520px) {
   .filters { grid-template-columns: 1fr; }
+  .tz-picker .tz-text { display: none; }
 }
 
 /* ── Admin activity logs ───────────────────────────────────────────────────*/

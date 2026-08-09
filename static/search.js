@@ -15,9 +15,21 @@
     video: "Video", audio: "Audio", transcript: "Transcript", chat: "Chat",
     questions: "Questions", summary: "Summary", notes: "Notes", other: "Other",
   };
+  // The multi-select file-type options — same keys and order as CATEGORY_LABELS.
+  const FILE_TYPES = [
+    { value: "video", label: "Video (.mp4)" },
+    { value: "audio", label: "Audio (.m4a)" },
+    { value: "transcript", label: "Transcript (.vtt)" },
+    { value: "chat", label: "Chat (.txt)" },
+    { value: "questions", label: "Questions (.html)" },
+    { value: "summary", label: "AI summary (.txt)" },
+    { value: "notes", label: "Notes (.txt)" },
+  ];
 
   // key -> record, for the rows currently rendered
   let currentRows = new Map();
+  // the last search response, so a timezone switch can re-render without re-querying
+  let lastData = null;
   // selection persists across pages of the SAME search: key -> size (bytes),
   // so the bulk bar can total files that are no longer on the visible page.
   const selected = new Map();
@@ -32,6 +44,90 @@
   let allowedDepartments = [];
   let allHosts = [];               // union across allowed departments
   let hostsByDepartment = {};      // { department: [hosts] }
+
+  // ── stored preferences (timezone, playback speed, captions) ──────────────
+  // localStorage throws in some privacy modes; a lost preference must never take
+  // the page down with it.
+  function readPref(key) {
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+  }
+  function writePref(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) { /* preference is optional */ }
+  }
+
+  // ── time zones ───────────────────────────────────────────────────────────
+  // Recordings are FILED under their IST date/time (that is what the S3 folders
+  // say). The browser converts that instant for display; the date FILTER still
+  // works on the filed IST date, which is why the filter label says so.
+  const TZ_KEY = "portal.timezone";
+  const ZONES = {
+    IST: { id: "Asia/Kolkata",     label: "IST", note: "India Standard Time" },
+    EST: { id: "America/New_York", label: "EST", note: "US Eastern (EST/EDT)" },
+    UTC: { id: "UTC",              label: "UTC", note: "Coordinated Universal Time" },
+  };
+  // Offset of the zone a recording's folder time is written in. IST observes no
+  // DST, so one fixed offset is exact all year.
+  const SOURCE_OFFSETS = { IST: "+05:30", UTC: "+00:00" };
+  const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+  let tzKey = ZONES[readPref(TZ_KEY)] ? readPref(TZ_KEY) : "IST";
+  let fmtCache = { id: "", date: null, time: null };
+
+  function zone() { return ZONES[tzKey] || ZONES.IST; }
+
+  function formatters() {
+    const z = zone();
+    if (fmtCache.id !== z.id) {
+      try {
+        fmtCache = {
+          id: z.id,
+          date: new Intl.DateTimeFormat("en-CA",
+            { timeZone: z.id, year: "numeric", month: "2-digit", day: "2-digit" }),
+          time: new Intl.DateTimeFormat("en-US",
+            { timeZone: z.id, hour: "numeric", minute: "2-digit", hour12: true }),
+        };
+      } catch (e) {
+        fmtCache = { id: z.id, date: null, time: null };   // no tz data — show as filed
+      }
+    }
+    return fmtCache;
+  }
+
+  // The instant a recording started, or null when its folder carries no time
+  // (Interview-Success layout A). A missing time is shown as "—" rather than
+  // guessed at midnight, which would then convert into the wrong day.
+  function recordMoment(r) {
+    if (!r || !r.date || !ISO_DATE_RE.test(r.date) || !r.time) return null;
+    const offset = SOURCE_OFFSETS[r.time_zone || "IST"] || SOURCE_OFFSETS.IST;
+    const d = new Date(r.date + "T" + r.time + ":00" + offset);
+    return isNaN(d.getTime()) ? null : d;
+  }
+
+  function dateCell(r) {
+    const at = recordMoment(r);
+    const f = formatters();
+    if (!at || !f.date) {
+      return `<span title="Filed as ${esc(r.date || "no date")} (IST) — no start time recorded">` +
+        `${esc(r.date || "—")}</span>`;
+    }
+    return esc(f.date.format(at));
+  }
+
+  function timeCell(r) {
+    const at = recordMoment(r);
+    const f = formatters();
+    if (!at || !f.time) {
+      return `<span class="cell-muted" title="This recording's folder carries no start time">—</span>`;
+    }
+    return esc(f.time.format(at));
+  }
+
+  function updateZoneHint() {
+    const el = $("zone-hint");
+    if (!el) return;
+    if (tzKey === "IST") { el.textContent = ""; el.style.display = "none"; return; }
+    el.style.display = "";
+    el.textContent = `Times converted to ${zone().label} · recordings are filed by IST date`;
+  }
 
   // ── helpers ──────────────────────────────────────────────────────────────
   function fmtSize(bytes) {
@@ -177,14 +273,21 @@
 
     const deptSel = $("f-dept");
     const deptVal = deptSel ? deptSel.value : "";
+    // A calendar selection travels as an explicit from/to range; anything else the
+    // user typed ("2026-06" for a whole month) stays a free-text date filter.
+    const picked = datePicker.get();
+    const hasRange = !!(picked.from || picked.to);
+    const types = fileTypes.get();
 
     const params = new URLSearchParams({
       candidate: $("f-candidate").value,
       company: $("f-company").value,
       host: $("f-host").value,
-      date: $("f-date").value,
+      date: hasRange ? "" : picked.raw,
+      date_from: picked.from,
+      date_to: picked.to,
       meeting_id: $("f-meeting").value,
-      file_type: $("f-filetype").value,
+      file_type: types.join(","),
       department: deptVal,
       page: String(page),
       per_page: $("per-page").value,
@@ -196,8 +299,9 @@
     // a query, so it does NOT count — otherwise a blank submit would dump the whole
     // department. A user who actively picks a department (multi-dept) does count.
     const deptIsQuery = deptSel && !deptSel.disabled && deptVal.trim() !== "";
-    const otherFilters = ["f-candidate", "f-company", "f-host", "f-date", "f-meeting", "f-filetype"]
-      .some((id) => $(id).value.trim() !== "");
+    const otherFilters =
+      ["f-candidate", "f-company", "f-host", "f-meeting"].some((id) => $(id).value.trim() !== "") ||
+      hasRange || picked.raw.trim() !== "" || types.length > 0;
     if (!otherFilters && !deptIsQuery) {
       summary.innerHTML = "";
       selected.clear(); currentRows = new Map(); updateBulkBar();
@@ -246,6 +350,7 @@
 
   function renderResults(data, keepSelection) {
     const rows = data.results || [];
+    lastData = data;                  // a timezone switch re-renders from this
     // The server is the source of truth for permission on every response.
     if (typeof data.can_download === "boolean") canDownload = data.can_download;
     if (!keepSelection) selected.clear();
@@ -278,12 +383,13 @@
         `</td>`;
       return `<tr data-key="${esc(r.key)}">
         ${checkCell}
-        <td>${esc(r.department)}</td>
-        <td>${esc(r.host)}</td>
+        <td class="col-clip" title="${esc(r.department)}">${esc(r.department)}</td>
+        <td class="col-clip" title="${esc(r.host)}">${esc(r.host)}</td>
         <td class="candidate">${candidateCell(r)}</td>
-        <td>${esc(r.company)}</td>
-        <td>${esc(r.date)}</td>
-        <td>${esc(r.round)}</td>
+        <td class="col-clip" title="${esc(r.company)}">${esc(r.company)}</td>
+        <td class="col-date">${dateCell(r)}</td>
+        <td class="col-time">${timeCell(r)}</td>
+        <td class="col-clip" title="${esc(r.round)}">${esc(r.round)}</td>
         <td>${esc(r.meeting_id)}</td>
         <td><span class="ft-tag ft-${esc(cat)}">${esc(CATEGORY_SHORT[cat] || cat)}</span></td>
         <td class="wrap">${esc(r.filename)}</td>
@@ -294,6 +400,9 @@
 
     const checkHead = canDownload
       ? `<th class="col-check"><input type="checkbox" id="check-all" aria-label="Select all"></th>` : "";
+    // The zone lives in the header so a converted column is never mistaken for
+    // the raw IST value stored in S3.
+    const zoneTag = `<span class="th-zone">${esc(zone().label)}</span>`;
 
     resultsArea.innerHTML = `
       <div class="table-wrap">
@@ -301,7 +410,8 @@
           <thead>
             <tr>
               ${checkHead}
-              <th>Department</th><th>Host</th><th>Candidate</th><th>Company</th><th>Date</th><th>Round</th>
+              <th>Department</th><th>Host</th><th>Candidate</th><th>Company</th>
+              <th>Date ${zoneTag}</th><th>Time ${zoneTag}</th><th>Round</th>
               <th>Meeting ID</th><th>Type</th><th>File</th><th>Size</th><th></th>
             </tr>
           </thead>
@@ -430,8 +540,9 @@
   }
 
   function clearFilters() {
-    ["f-candidate", "f-company", "f-date", "f-meeting", "f-host", "f-filetype"]
-      .forEach((id) => ($(id).value = ""));
+    ["f-candidate", "f-company", "f-meeting", "f-host"].forEach((id) => ($(id).value = ""));
+    datePicker.clear();
+    fileTypes.clear();
     // Only reset the department when the user can actually change it (multi-dept);
     // a single-department user stays scoped to their one department.
     const deptSel = $("f-dept");
@@ -508,13 +619,8 @@
     previewModal.dataset.previewKey = rec.key || "";   // anti-capture.js reads this
     previewModal.style.display = "flex";
 
-    if (cat === "video") {
-      previewBody.innerHTML =
-        `<video class="preview-media" controls autoplay playsinline controlslist="nodownload noplaybackrate" ` +
-        `disablepictureinpicture oncontextmenu="return false" src="${esc(url)}"></video>`;
-    } else if (cat === "audio") {
-      previewBody.innerHTML =
-        `<audio class="preview-media" controls autoplay controlslist="nodownload" src="${esc(url)}"></audio>`;
+    if (cat === "video" || cat === "audio") {
+      renderPlayer(rec, cat, url);
     } else if (cat === "questions" || rec.ext === "html") {
       // Render HTML in a sandboxed iframe (no scripts) so it can't touch the page.
       fetch(url).then((r) => r.text()).then((html) => {
@@ -541,6 +647,133 @@
     return `<div class="empty"><div class="big">⚠️</div>Couldn’t load this file for preview.</div>`;
   }
 
+  // ── player: playback speed + captions ─────────────────────────────────────
+  // Both preferences are remembered, because someone reviewing a stack of
+  // interviews at 1.5× with captions on wants that on every recording, not once.
+  const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
+  const RATE_KEY = "portal.playbackRate";
+  const CC_KEY = "portal.captions";
+
+  function storedRate() {
+    const value = parseFloat(readPref(RATE_KEY));
+    return SPEEDS.indexOf(value) !== -1 ? value : 1;
+  }
+
+  function renderPlayer(rec, cat, url) {
+    const media = cat === "video"
+      // "noplaybackrate" is deliberately NOT set: the native speed menu and the
+      // buttons below stay in sync, so either way of changing speed works.
+      ? `<video id="preview-player" class="preview-media" controls autoplay playsinline ` +
+        `controlslist="nodownload" disablepictureinpicture oncontextmenu="return false" ` +
+        `src="${esc(url)}"></video>`
+      : `<audio id="preview-player" class="preview-media" controls autoplay ` +
+        `controlslist="nodownload" src="${esc(url)}"></audio>`;
+
+    previewBody.innerHTML = media +
+      `<div class="player-bar">
+         <div class="player-group">
+           <span class="player-label">Speed</span>
+           <div class="player-btns" id="speed-btns">` +
+             SPEEDS.map((s) =>
+               `<button type="button" class="player-btn" data-rate="${s}">${s}×</button>`).join("") +
+           `</div>
+         </div>
+         <div class="player-group" id="cc-group" hidden>
+           <span class="player-label">Captions</span>
+           <div class="player-btns" id="cc-btns"></div>
+         </div>
+       </div>`;
+
+    const player = $("preview-player");
+    wireSpeed(player);
+    if (cat === "video") loadCaptions(player, rec);
+  }
+
+  function syncSpeedButtons(rate) {
+    const box = $("speed-btns");
+    if (!box) return;
+    box.querySelectorAll(".player-btn").forEach((b) => {
+      b.classList.toggle("active", Math.abs(parseFloat(b.dataset.rate) - rate) < 0.001);
+    });
+  }
+
+  function wireSpeed(player) {
+    const box = $("speed-btns");
+    box.querySelectorAll(".player-btn").forEach((b) => {
+      b.addEventListener("click", () => {
+        const rate = parseFloat(b.dataset.rate);
+        player.playbackRate = rate;
+        writePref(RATE_KEY, String(rate));
+      });
+    });
+    player.playbackRate = storedRate();
+    syncSpeedButtons(player.playbackRate);
+    // Browsers reset the rate when new media metadata arrives, and the native
+    // controls can change it behind our back — re-apply, then follow along.
+    player.addEventListener("loadedmetadata", () => { player.playbackRate = storedRate(); });
+    player.addEventListener("ratechange", () => {
+      writePref(RATE_KEY, String(player.playbackRate));
+      syncSpeedButtons(player.playbackRate);
+    });
+  }
+
+  async function loadCaptions(player, rec) {
+    let tracks = [];
+    try {
+      const resp = await fetch("/api/captions?key=" + encodeURIComponent(rec.key));
+      if (!resp.ok) return;                        // no captions is not an error worth showing
+      tracks = (await resp.json()).tracks || [];
+    } catch (e) {
+      return;
+    }
+    // The modal may have been closed or moved on to another file while the
+    // lookup was in flight — never attach tracks to a player that is gone.
+    if (!tracks.length || $("preview-player") !== player) return;
+
+    const name = (t, i) => (tracks.length > 1 ? `${t.label} ${i + 1}` : t.label);
+    const box = $("cc-btns");
+    box.innerHTML = `<button type="button" class="player-btn" data-track="-1">Off</button>` +
+      tracks.map((t, i) =>
+        `<button type="button" class="player-btn" data-track="${i}">${esc(name(t, i))}</button>`).join("");
+    $("cc-group").hidden = false;
+
+    // textTracks is indexed in the order the <track> elements are appended, so a
+    // button's data-track index addresses the track it names.
+    const select = (index) => {
+      for (let i = 0; i < player.textTracks.length; i++) {
+        player.textTracks[i].mode = i === index ? "showing" : "disabled";
+      }
+      writePref(CC_KEY, index >= 0 ? "on" : "off");
+      box.querySelectorAll(".player-btn").forEach((b) => {
+        b.classList.toggle("active", parseInt(b.dataset.track, 10) === index);
+      });
+    };
+
+    tracks.forEach((t, i) => {
+      const el = document.createElement("track");
+      el.kind = "subtitles";
+      el.label = name(t, i);
+      el.srclang = "en";
+      el.src = t.src;
+      // A caption file that will not load (unreadable object, oversized transcript
+      // served straight from S3) must not leave behind a button that does nothing.
+      el.addEventListener("error", () => {
+        const btn = box.querySelector(`.player-btn[data-track="${i}"]`);
+        if (!btn) return;
+        const wasActive = btn.classList.contains("active");
+        btn.disabled = true;
+        btn.title = "This caption file could not be loaded.";
+        if (wasActive) select(-1);
+      });
+      player.appendChild(el);
+    });
+
+    box.querySelectorAll(".player-btn").forEach((b) => {
+      b.addEventListener("click", () => select(parseInt(b.dataset.track, 10)));
+    });
+    select(readPref(CC_KEY) === "on" ? 0 : -1);
+  }
+
   function closePreview() {
     previewModal.style.display = "none";
     previewModal.dataset.previewKey = "";
@@ -554,6 +787,31 @@
   });
 
   // ── wire up ──────────────────────────────────────────────────────────────
+  // Multi-select file type: several categories in one search ("video,audio").
+  const fileTypes = window.MultiSelect({
+    mount: $("filetype-mount"),
+    id: "f-filetype",
+    options: FILE_TYPES,
+    allLabel: "All types",
+    noun: "types",
+  });
+  // Interactive calendar: one day, a range, or free text like "2026-06".
+  const datePicker = window.DateRangePicker({ input: $("f-date") });
+
+  const tzSelect = $("tz-select");
+  if (tzSelect) {
+    tzSelect.value = tzKey;
+    tzSelect.addEventListener("change", () => {
+      tzKey = ZONES[tzSelect.value] ? tzSelect.value : "IST";
+      writePref(TZ_KEY, tzKey);
+      updateZoneHint();
+      // Purely a display change — re-render the rows we already have instead of
+      // asking the server for the same page again.
+      if (lastData) renderResults(lastData, true);
+    });
+  }
+  updateZoneHint();
+
   $("search-form").addEventListener("submit", runSearch);
   $("f-dept").addEventListener("change", refreshHostOptions);
   // Re-run from page 1 when sort/page-size changes; selection survives (same set).

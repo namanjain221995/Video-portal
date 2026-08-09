@@ -14,7 +14,16 @@ Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{Me
   (e.g. `Advanced-Training`, where every attendee is hyphen-joined into one
   candidate folder) are searched **per attendee** — searching one person finds
   the meeting and the results show who matched plus a "+N more" roster.
-- **Filter** by company, date (e.g. `2026-06-10` or `2026-06`), meeting ID, and file type (MP4 / M4A / TRANSCRIPT / CHAT…).
+- **Filter** by company, meeting ID, host, department, **date** (an interactive
+  calendar: one day, a date range, quick presets like "Last 30 days", or typed
+  free text such as `2026-06` for a whole month) and **file type** — a
+  multi-select, so `Video + Transcript` is one search rather than two.
+- **Date *and* Time columns**, read from the `Time-*-IST` folder in the key. A
+  timezone picker in the header shows every recording in **IST / EST / UTC**
+  (a recording whose layout carries no time folder shows `—`, never a guess).
+- **Playback speed** (0.5×–2×) and **captions** on the in-browser preview.
+  Captions come from the `.vtt` transcript stored in the same meeting folder;
+  both preferences are remembered between recordings.
 - **Download** individual files (direct from S3 via pre-signed URLs) or **all filtered results as a zip**.
 - **Admin** accounts come from `.env`; admins create normal **users** stored (hashed) in `users.json`.
 - **Audit logs** give admins a searchable history of logins, searches, previews,
@@ -154,12 +163,17 @@ Add HTTPS (443 + a certificate, e.g. Caddy or certbot) before any public use.
 | `auth.py` | Admins from `.env`, users in `users.json` (hashed) |
 | `audit_service.py` | Persistent SQLite activity log for the admin-only Logs page |
 | `templates/` | `login`, `search`, `admin`, and audit `logs` pages |
-| `static/` | CSS + JS |
+| `static/` | CSS + JS (`search.js` drives the page; `datepicker.js` / `multiselect.js` are the two standalone filter controls) |
 | `deploy/` | IAM policy, systemd unit, nginx config |
 
 The bucket is listed once and cached for `CACHE_TTL_SEC` (default 5 min). New
 recordings appear after the cache expires, or immediately via the **Refresh
 index** button.
+
+> The index carries a schema version (`INDEX_SCHEMA` in `s3_service.py`). It was
+> bumped to **5** when the meeting start time was added to each record, so the
+> first boot after deploying that change re-lists the bucket once (a few minutes
+> for ~80k objects) instead of serving records with no Time column.
 
 ### Notes / limits
 - **Bulk zip** streams each object through the app (uses EC2 bandwidth). Fine
@@ -177,6 +191,14 @@ index** button.
   URL) and the download/zip buttons are removed. Note this is a soft control:
   inline streaming can never be made fully un-saveable by a determined user — it
   stops casual downloads, not a screen recorder or devtools.
+- The **timezone picker converts what you see, not what you filter.** Recordings
+  are filed in S3 under their IST date, so the date filter (and the calendar's
+  presets) always work on that IST date; a banner says so whenever a non-IST
+  zone is selected. `EST` uses US Eastern, which follows daylight saving.
+- **Captions** need the meeting's `.vtt` to exist in S3 — no transcript, no
+  captions button. Very large transcripts are served straight from S3 rather than
+  proxied, and the browser will refuse those as a subtitle track; the button for
+  such a track is disabled rather than left silently dead.
 - Audit events are retained for 180 days by default. Set
   `AUDIT_RETENTION_DAYS=0` to disable age-based cleanup. A video `view` event means
   the preview was opened; direct-to-S3 playback does not prove watch duration.

@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Search · Recording Portal{% endblock %}
+{% block body_class %}page-wide{% endblock %}
 
 {% block body %}
 <header class="topbar">
@@ -8,6 +9,15 @@
     {% if demo %}<span class="badge badge-demo">DEMO DATA</span>{% endif %}
     <div class="spacer"></div>
     <span class="who">Signed in as <strong>{{ username }}</strong>{% if is_admin %} · admin{% endif %}</span>
+    <label class="tz-picker" for="tz-select">
+      <span class="tz-icon" aria-hidden="true">🕐</span>
+      <span class="tz-text">Times in</span>
+      <select class="input" id="tz-select" title="Show recording dates and times in this timezone">
+        <option value="IST">IST</option>
+        <option value="EST">EST</option>
+        <option value="UTC">UTC</option>
+      </select>
+    </label>
     {% if is_admin %}
     <a class="navlink" href="{{ url_for('admin_page') }}">Admin</a>
     <a class="navlink" href="{{ url_for('logs_page') }}">Logs</a>
@@ -48,25 +58,17 @@
           <select class="input" id="f-host"><option value="">All hosts</option></select>
         </div>
         <div class="field">
-          <label for="f-date">Date</label>
-          <input class="input" id="f-date" type="text" placeholder="2026-06-10 or 2026-06" autocomplete="off">
+          <label for="f-date">Date <span class="field-hint">single day or range</span></label>
+          <input class="input" id="f-date" type="text" placeholder="Pick a date or range"
+                 autocomplete="off" aria-haspopup="dialog">
         </div>
         <div class="field">
           <label for="f-meeting">Meeting ID</label>
           <input class="input" id="f-meeting" type="text" placeholder="e.g. 96355112813" autocomplete="off">
         </div>
         <div class="field">
-          <label for="f-filetype">File type</label>
-          <select class="input" id="f-filetype">
-            <option value="">All types</option>
-            <option value="video">Video (.mp4)</option>
-            <option value="audio">Audio (.m4a)</option>
-            <option value="transcript">Transcript (.vtt)</option>
-            <option value="chat">Chat (.txt)</option>
-            <option value="questions">Questions (.html)</option>
-            <option value="summary">AI summary (.txt)</option>
-            <option value="notes">Notes (.txt)</option>
-          </select>
+          <label for="f-filetype">File type <span class="field-hint">pick any number</span></label>
+          <div id="filetype-mount"></div>
         </div>
       </div>
 
@@ -83,6 +85,7 @@
   <!-- Results -->
   <div class="results-head">
     <h2>Results</h2>
+    <span class="zone-hint" id="zone-hint" style="display:none;"></span>
     <div class="spacer"></div>
     <span class="summary" id="summary"></span>
     <label class="results-ctl" for="sort-by">Sort
@@ -136,6 +139,8 @@
   </div>
 </div>
 
+<script src="{{ asset('multiselect.js') }}"></script>
+<script src="{{ asset('datepicker.js') }}"></script>
 <script src="{{ asset('search.js') }}"></script>
 <script src="{{ asset('anti-capture.js') }}"></script>
 {% endblock %}

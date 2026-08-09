@@ -286,6 +286,20 @@ def _int_arg(name, default):
         return default
 
 
+def _date_range_label(date_from, date_to):
+    """A picked date range as one short string for the audit log's date column
+    ("2026-06-01 to 2026-06-30", "from 2026-06-01", "until 2026-06-30")."""
+    date_from = (date_from or "").strip()
+    date_to = (date_to or "").strip()
+    if date_from and date_to:
+        return date_from if date_from == date_to else f"{date_from} to {date_to}"
+    if date_from:
+        return f"from {date_from}"
+    if date_to:
+        return f"until {date_to}"
+    return ""
+
+
 @app.route("/api/search")
 @login_required
 def api_search():
@@ -297,7 +311,13 @@ def api_search():
             "candidate": request.args.get("candidate", ""),
             "company": request.args.get("company", ""),
             "date": request.args.get("date", ""),
+            # Inclusive YYYY-MM-DD bounds from the date-range picker; either side
+            # may be empty (open-ended), and both equal is a single day. Anything
+            # that is not a full ISO date is ignored by s3_service.search.
+            "date_from": request.args.get("date_from", ""),
+            "date_to": request.args.get("date_to", ""),
             "meeting_id": request.args.get("meeting_id", ""),
+            # Comma-separated category keys — the file-type filter is multi-select.
             "file_type": request.args.get("file_type", ""),
             "host": request.args.get("host", ""),
             "department": request.args.get("department", ""),
@@ -317,7 +337,10 @@ def api_search():
                 candidate=filters["candidate"],
                 host=filters["host"],
                 meeting_id=filters["meeting_id"],
-                recording_date=filters["date"],
+                # One readable "what date did they ask for?" column, whether that
+                # was typed free-text or picked as a range.
+                recording_date=filters["date"] or _date_range_label(
+                    filters["date_from"], filters["date_to"]),
                 department=filters["department"],
                 file_type=filters["file_type"],
                 details={
@@ -438,6 +461,38 @@ def api_view_one():
         return redirect(url)
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
+
+
+# Folder name -> what the caption track is actually called in the player. Zoom
+# writes WebVTT into both TRANSCRIPT and CC folders.
+_CAPTION_TRACK_LABELS = {"cc": "Closed captions", "transcript": "Transcript"}
+
+
+@app.route("/api/captions")
+@login_required
+def api_captions():
+    """Subtitle tracks available for one media file: the .vtt transcript / closed
+    captions Zoom stored in the same meeting folder.
+
+    Metadata only — every track is served through /api/view, which re-checks
+    access on its own, and each key here is authorized again before it is even
+    named, so this can never disclose a file the caller may not open."""
+    key = request.args.get("key", "")
+    access = _current_access()
+    if s3_service.authorized_record(key, access["departments"], access["hosts"]) is None:
+        abort(404, "File not found.")
+
+    tracks = []
+    for rec in s3_service.caption_records(key):
+        if s3_service.authorized_record(rec["key"], access["departments"], access["hosts"]) is None:
+            continue
+        tracks.append({
+            "label": _CAPTION_TRACK_LABELS.get(
+                (rec.get("file_type") or "").strip().lower(), "Captions"),
+            "filename": rec.get("filename", ""),
+            "src": url_for("api_view_one", key=rec["key"]),
+        })
+    return jsonify({"tracks": tracks})
 
 
 @app.route("/api/download/bulk", methods=["POST"])
