@@ -94,6 +94,30 @@ def _save_users(users: dict) -> None:
     os.replace(tmp, USERS_FILE)
 
 
+def _stored_meetings(rec: dict) -> list:
+    """A user's individual meeting grants, normalised to
+    [{"meeting_id": str, "can_download": bool}, …].
+
+    These are ADDITIVE and stand on their own: a meeting grant reaches exactly
+    that meeting's files no matter which department they live in, which is the
+    point — sharing one interview with someone who should not get the whole
+    department. Each carries its own download flag, so a meeting can be shared
+    view-only even when the account may download elsewhere."""
+    out, seen = [], set()
+    for entry in rec.get("meetings") or []:
+        if isinstance(entry, str):                 # tolerate a bare id
+            entry = {"meeting_id": entry}
+        if not isinstance(entry, dict):
+            continue
+        meeting_id = str(entry.get("meeting_id") or "").strip()
+        if not meeting_id or meeting_id in seen:
+            continue
+        seen.add(meeting_id)
+        out.append({"meeting_id": meeting_id,
+                    "can_download": bool(entry.get("can_download", False))})
+    return out
+
+
 def list_users() -> list:
     """Accounts as the Admin page should show them — i.e. the EFFECTIVE grant, with
     split parents already expanded, so the ticked boxes match what user_access()
@@ -111,6 +135,7 @@ def list_users() -> list:
                     "created_by": rec.get("created_by"),
                     "departments": depts,
                     "hosts": hosts,
+                    "meetings": _stored_meetings(rec),
                     "can_download": bool(rec.get("can_download", True))})
     return sorted(out, key=lambda x: x["username"].lower())
 
@@ -118,8 +143,9 @@ def list_users() -> list:
 def user_access(username: str) -> dict:
     """The access a normal user was granted: which departments they may browse,
     an optional per-department host restriction ({dept: [host, …]} — a missing or
-    empty entry means EVERY host in that department), and whether they may
-    download (vs view-only). Missing fields fall back to the legacy defaults so
+    empty entry means EVERY host in that department), individually shared meetings
+    ({meeting_id: can_download}), and whether they may download inside their
+    departments (vs view-only). Missing fields fall back to the legacy defaults so
     pre-existing accounts keep working unchanged."""
     rec = _load_users().get((username or "").strip()) or {}
     depts = rec.get("departments")
@@ -128,11 +154,13 @@ def user_access(username: str) -> dict:
     depts, hosts = _expand_split(depts, rec.get("hosts") or {})
     return {"departments": depts,
             "hosts": hosts,
+            "meetings": {m["meeting_id"]: m["can_download"] for m in _stored_meetings(rec)},
             "can_download": bool(rec.get("can_download", True))}
 
 
 def create_user(username: str, password: str, created_by: str = "",
-                departments=None, hosts=None, can_download: bool = True) -> None:
+                departments=None, hosts=None, can_download: bool = True,
+                meetings=None) -> None:
     username = (username or "").strip()
     if not username or not password:
         raise ValueError("Username and password are both required.")
@@ -150,15 +178,22 @@ def create_user(username: str, password: str, created_by: str = "",
             "created_by": created_by,
             "departments": list(departments or []),
             "hosts": dict(hosts or {}),
+            "meetings": _stored_meetings({"meetings": meetings}),
             "can_download": bool(can_download),
         }
         _save_users(users)
 
 
-def update_user_access(username: str, departments=None, hosts=None, can_download=None) -> None:
+def update_user_access(username: str, departments=None, hosts=None,
+                       can_download=None, meetings=None) -> None:
     """Change an existing user's department grant, per-department host
-    restriction and/or download permission. Pass None for a field to leave it
-    unchanged. Host entries for departments the user no longer has are pruned."""
+    restriction, individually shared meetings and/or download permission. Pass
+    None for a field to leave it unchanged. Host entries for departments the user
+    no longer has are pruned.
+
+    Meeting grants are deliberately NOT pruned against the department list: a
+    shared meeting is meant to survive on its own, and dropping it when the
+    department is unticked would silently revoke the very access it exists for."""
     username = (username or "").strip()
     with _lock:
         users = _load_users()
@@ -172,6 +207,8 @@ def update_user_access(username: str, departments=None, hosts=None, can_download
         granted = set(rec.get("departments") or [])
         rec["hosts"] = {d: h for d, h in (rec.get("hosts") or {}).items()
                         if d in granted and h}
+        if meetings is not None:
+            rec["meetings"] = _stored_meetings({"meetings": meetings})
         if can_download is not None:
             rec["can_download"] = bool(can_download)
         _save_users(users)

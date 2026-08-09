@@ -878,7 +878,48 @@ def _host_allowed(rec, allowed_hosts) -> bool:
     return not hs or rec["host"] in hs
 
 
-def filter_options(departments=None, allowed_hosts=None, block: bool = False):
+def _in_department_grant(rec, allowed_departments, allowed_hosts) -> bool:
+    """Does the caller reach this record through their DEPARTMENT grant?
+    `allowed_departments=None` means "no mask" (an admin / an internal caller)."""
+    if allowed_departments is not None and rec["department"] not in allowed_departments:
+        return False
+    return _host_allowed(rec, allowed_hosts)
+
+
+def _in_meeting_grant(rec, allowed_meetings) -> bool:
+    """Does the caller reach this record through an individually shared meeting?
+
+    Keyed on the meeting id alone, so every file of that meeting (video, audio,
+    transcript, chat) comes with it — that is what "share this meeting" means.
+    Deliberately independent of the department mask: the whole point of a meeting
+    grant is to reach one recording inside a department the user cannot browse."""
+    return bool(allowed_meetings) and rec["meeting_id"] in allowed_meetings
+
+
+def _visible(rec, allowed_departments, allowed_hosts, allowed_meetings) -> bool:
+    """The single access rule: a record is reachable through the department grant
+    OR through an individual meeting grant. Every route funnels through this."""
+    return (_in_department_grant(rec, allowed_departments, allowed_hosts)
+            or _in_meeting_grant(rec, allowed_meetings))
+
+
+def record_downloadable(rec, access) -> bool:
+    """May this caller DOWNLOAD this particular record (vs only stream it)?
+
+    Download stopped being one flag per account when meetings became shareable:
+    a meeting can be shared view-only with someone who may download their own
+    departments, and vice versa. The most permissive route the caller actually
+    has to the file wins — being denied a download of a file you could already
+    download through your department would make no sense."""
+    if access.get("can_download") and _in_department_grant(
+            rec, access.get("departments"), access.get("hosts")):
+        return True
+    meetings = access.get("meetings") or {}
+    return bool(meetings.get(rec["meeting_id"]))
+
+
+def filter_options(departments=None, allowed_hosts=None, allowed_meetings=None,
+                   block: bool = False):
     """Values for the server-side dropdowns (hosts + departments). Non-blocking by
     default: returns whatever is already cached so a page load never triggers a
     ~27s S3 scan. Pass block=True to force the index to be built first.
@@ -896,11 +937,12 @@ def filter_options(departments=None, allowed_hosts=None, block: bool = False):
         if not recs:
             return {"hosts": [], "departments": []}
 
-    if departments is not None:
-        allowed = set(departments)
-        recs = [r for r in recs if r["department"] in allowed]
-    if allowed_hosts:
-        recs = [r for r in recs if _host_allowed(r, allowed_hosts)]
+    if departments is not None or allowed_hosts or allowed_meetings:
+        allowed = set(departments) if departments is not None else None
+        # Same rule the search uses, so a shared meeting's host actually appears
+        # in the Host dropdown instead of the user filtering by a host they can
+        # see in their own results but not select.
+        recs = [r for r in recs if _visible(r, allowed, allowed_hosts, allowed_meetings)]
 
     # Hosts grouped per department, so the UI can narrow the Host dropdown to the
     # chosen department instead of always showing every allowed department's hosts.
@@ -962,7 +1004,7 @@ def _clean_iso_date(value):
 
 def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
            department="", date_from="", date_to="", allowed_departments=None,
-           allowed_hosts=None, limit=None, offset=0, sort=""):
+           allowed_hosts=None, allowed_meetings=None, limit=None, offset=0, sort=""):
     """Filter the index. Returns (rows, total, total_size) where rows is the
     `offset:offset+limit` page (limit defaults to RESULT_LIMIT) of the sorted
     match set, while total/total_size reflect the FULL match set.
@@ -970,10 +1012,12 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     `allowed_departments` is the access mask for the signed-in user: records outside
     it are dropped BEFORE any other filter, so a user can never reach a department
     they were not granted (admins pass the full list). `allowed_hosts` narrows a
-    granted department further to specific hosts ({dept: [host, …]}); both masks
-    are applied before the user's own filters, so a crafted host/department query
-    param can never widen access. `department` is an optional user-chosen
-    narrowing within that allowed set.
+    granted department further to specific hosts ({dept: [host, …]}).
+    `allowed_meetings` ({meeting_id: can_download}) ADDS individually shared
+    meetings on top, wherever they live. All three masks are applied before the
+    user's own filters, so a crafted host/department query param can never widen
+    access. `department` is an optional user-chosen narrowing, and it narrows the
+    visible set only — it can never reveal a record the masks excluded.
 
     `file_type` accepts SEVERAL categories at once ("video,audio" or a list), and
     `date_from`/`date_to` are an inclusive YYYY-MM-DD range — either bound alone is
@@ -1008,9 +1052,8 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     recs = get_records()
     out = []
     for r in recs:
-        if allowed is not None and r["department"] not in allowed:   # access mask first
-            continue
-        if not _host_allowed(r, allowed_hosts):                      # host mask second
+        # Access mask first, always: department+host grant OR a shared meeting.
+        if not _visible(r, allowed, allowed_hosts, allowed_meetings):
             continue
         if department and department != r["department"]:
             continue
@@ -1060,6 +1103,99 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Meeting lookup (admin-only — powers the "share a single meeting" picker)
+# ─────────────────────────────────────────────────────────────────────────────
+MEETING_LOOKUP_LIMIT = 25
+
+
+def _collect_meeting(groups, r):
+    """Fold one record into the {meeting_id: aggregate} accumulator."""
+    g = groups.get(r["meeting_id"])
+    if g is None:
+        g = groups[r["meeting_id"]] = {
+            "meeting_id": r["meeting_id"], "files": 0, "size": 0,
+            "departments": set(), "hosts": set(), "candidates": [],
+            "dates": set(), "times": set(),
+        }
+    g["files"] += 1
+    g["size"] += r["size"]
+    g["departments"].add(r["department"])
+    g["hosts"].add(r["host"])
+    if r["date"]:
+        g["dates"].add(r["date"])
+    if r["time"]:
+        g["times"].add(r["time"])
+    for name in (r.get("candidates") or [r["candidate"]]):
+        if name not in g["candidates"] and len(g["candidates"]) < 12:
+            g["candidates"].append(name)
+
+
+def _finish_meeting(g):
+    """The JSON-friendly summary of one accumulated meeting."""
+    dates = sorted(g["dates"])
+    return {
+        "meeting_id": g["meeting_id"],
+        "files": g["files"],
+        "size": g["size"],
+        "departments": sorted(g["departments"], key=str.lower),
+        "hosts": sorted(g["hosts"], key=str.lower),
+        "candidates": g["candidates"],
+        "dates": dates,
+        "time": sorted(g["times"])[0] if g["times"] else "",
+        # >1 means a RECURRING id: granting it shares every one of those sessions.
+        "occurrences": len(dates),
+    }
+
+
+def meeting_summaries(query="", limit=MEETING_LOOKUP_LIMIT):
+    """Meetings matching a free-text query, collapsed to one row per meeting id.
+
+    Feeds the admin's meeting picker, so it deliberately spans EVERY department —
+    an admin already sees everything, and picking a meeting to share is exactly
+    the moment they need to look outside one department. Never call this on
+    behalf of a normal user."""
+    q = (query or "").strip().lower()
+    if not q:
+        return []
+    toks = _cand_tokens(q)
+    groups = {}
+    for r in get_records():
+        if not r["meeting_id"]:
+            continue
+        if not (q in r["meeting_id"].lower()
+                or q in r["department"].lower()
+                or q in r["host"].lower()
+                or q in (r["company"] or "").lower()
+                or q in r["date"]
+                or (toks and _match_candidate(toks, r))):
+            continue
+        _collect_meeting(groups, r)
+
+    out = [_finish_meeting(g) for g in groups.values()]
+    # Most recent first: an admin is nearly always sharing something just recorded.
+    out.sort(key=lambda m: (m["dates"][-1] if m["dates"] else "", m["meeting_id"]),
+             reverse=True)
+    return out[:max(1, int(limit or MEETING_LOOKUP_LIMIT))]
+
+
+def meeting_details(meeting_ids):
+    """{meeting_id: summary} for specific ids — what an ALREADY granted meeting
+    actually is, so the admin page can show "96355112813 · Akhilendra · HR" rather
+    than a bare number nobody can verify. One pass for the whole set.
+
+    An id with no summary (recording deleted, index still warming) is simply
+    absent; the grant itself is never dropped on that basis."""
+    wanted = {str(m).strip() for m in (meeting_ids or []) if str(m).strip()}
+    if not wanted:
+        return {}
+    groups = {}
+    for r in get_records():
+        if r["meeting_id"] in wanted:
+            _collect_meeting(groups, r)
+    return {mid: _finish_meeting(g) for mid, g in groups.items()}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Downloads
 # ─────────────────────────────────────────────────────────────────────────────
 def record_for_key(key: str):
@@ -1092,29 +1228,32 @@ def caption_records(key: str):
     return sorted(siblings, key=lambda r: (r["file_type"].lower(), r["filename"].lower()))
 
 
-def key_allowed(key: str, allowed_departments, allowed_hosts=None) -> bool:
-    """Server-side gate for download/view: the key must exist in the index, sit in
-    a department the caller was granted AND (when a host restriction applies) be
-    hosted by one of their granted hosts. Never trust a key from the client alone."""
-    return authorized_record(key, allowed_departments, allowed_hosts) is not None
+def key_allowed(key: str, allowed_departments, allowed_hosts=None, allowed_meetings=None) -> bool:
+    """Server-side gate for download/view: the key must exist in the index and be
+    reachable either through the caller's department grant (respecting any host
+    restriction) or through an individually shared meeting. Never trust a key
+    from the client alone."""
+    return authorized_record(key, allowed_departments, allowed_hosts, allowed_meetings) is not None
 
 
-def authorized_record(key: str, allowed_departments, allowed_hosts=None):
+def authorized_record(key: str, allowed_departments, allowed_hosts=None, allowed_meetings=None):
     """Return the indexed record when ``key`` is inside the caller's access mask.
 
     Routes that need recording metadata (for example the audit log) use this
     helper so authorization and metadata lookup are one atomic decision against
     the same cached index.  ``None`` deliberately covers both an unknown key and
     a known-but-forbidden key, preventing callers from learning which one it was.
+
+    Note the department list is treated as an explicit allow-list here (an empty
+    list grants nothing), unlike search()'s ``None`` = "no mask" — every caller of
+    this function passes a real user's grant.
     """
     if not key:
         return None
     rec = _records_by_key().get(key)
     if rec is None:
         return None
-    if rec["department"] not in (allowed_departments or []):
-        return None
-    if not _host_allowed(rec, allowed_hosts):
+    if not _visible(rec, set(allowed_departments or []), allowed_hosts, allowed_meetings):
         return None
     return rec
 

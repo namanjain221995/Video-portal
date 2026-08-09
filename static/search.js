@@ -393,11 +393,22 @@
     const body = rows.map((r) => {
       const cat = r.category || "other";
       const dl = "/api/download?key=" + encodeURIComponent(r.key);
+      // Download is per RECORD: a meeting shared with this account view-only sits
+      // next to departments it may download from. The server decides; this only
+      // stops the UI from offering a button that would 403.
+      const rowDl = rowDownloadable(r);
       const checkCell = canDownload
-        ? `<td class="col-check"><input type="checkbox" class="row-check"${selected.has(r.key) ? " checked" : ""} aria-label="Select"></td>` : "";
+        ? (rowDl
+            ? `<td class="col-check"><input type="checkbox" class="row-check"${selected.has(r.key) ? " checked" : ""} aria-label="Select"></td>`
+            : `<td class="col-check"><span class="cell-muted" title="Shared with you as view-only — cannot be added to a zip">–</span></td>`)
+        : "";
       const actionCell = `<td class="col-actions">` +
         `<button class="btn btn-ghost btn-sm view-btn" type="button" title="View in browser">▶ View</button>` +
-        (canDownload ? ` <a class="btn btn-ghost btn-sm" href="${dl}" title="Download">⬇</a>` : "") +
+        (canDownload
+          ? (rowDl
+              ? ` <a class="btn btn-ghost btn-sm" href="${dl}" title="Download">⬇</a>`
+              : ` <span class="badge badge-muted" title="This recording was shared with you as view-only">view only</span>`)
+          : "") +
         `</td>`;
       return `<tr data-key="${esc(r.key)}">
         ${checkCell}
@@ -461,11 +472,22 @@
     }
   }
 
+  // A row the server marked view-only carries no checkbox, so "select all" and
+  // the all-selected state must both ignore it — otherwise the header checkbox
+  // could never settle on checked.
+  function rowDownloadable(r) {
+    return canDownload && r && r.can_download !== false;
+  }
+
+  function selectableKeys() {
+    const keys = [];
+    currentRows.forEach((r, k) => { if (rowDownloadable(r)) keys.push(k); });
+    return keys;
+  }
+
   function pageFullySelected() {
-    if (currentRows.size === 0) return false;
-    let allIn = true;
-    currentRows.forEach((r, k) => { if (!selected.has(k)) allIn = false; });
-    return allIn;
+    const keys = selectableKeys();
+    return keys.length > 0 && keys.every((k) => selected.has(k));
   }
 
   function onRowToggle(e) {
@@ -482,6 +504,7 @@
     const on = e.target.checked;
     resultsArea.querySelectorAll("tr[data-key]").forEach((tr) => {
       const cb = tr.querySelector(".row-check");
+      if (!cb) return;                    // view-only row: nothing to select
       cb.checked = on;
       const r = currentRows.get(tr.dataset.key);
       if (on) selected.set(tr.dataset.key, r ? Number(r.size) || 0 : 0);

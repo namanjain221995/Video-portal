@@ -19,7 +19,7 @@
   <div class="page-head">
     <div>
       <h1>User management</h1>
-      <p>Create users and control which <strong>departments</strong> they can browse and whether they can <strong>download</strong> or only view. Admins are configured in <code>.env</code> and can see everything.</p>
+      <p>Create users and control which <strong>departments</strong> they can browse and whether they can <strong>download</strong> or only view. You can also share an <strong>individual meeting</strong> from any department, with its own view/download choice. Admins are configured in <code>.env</code> and can see everything.</p>
     </div>
   </div>
 
@@ -61,7 +61,12 @@
           <div id="new-hosts" class="host-restrict"></div>
         </div>
         <div class="field">
-          <label for="new-perm">Access</label>
+          <label>Shared meetings (optional)</label>
+          <p class="user-meta host-hint">Give access to a single meeting from <strong>any</strong> department — even one this user cannot otherwise browse. Each meeting gets its own view/download choice.</p>
+          <div id="new-meetings"></div>
+        </div>
+        <div class="field">
+          <label for="new-perm">Access <span class="field-hint">inside their departments</span></label>
           <select class="input" id="new-perm">
             <option value="view">View only (stream in browser, no download)</option>
             <option value="download">Can download (view + download/zip)</option>

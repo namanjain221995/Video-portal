@@ -26,6 +26,10 @@ Interview-Success/{Host}/{Year}/{Month}/{Candidate}/{Company}/{Date}/{Round}/{Me
   both preferences are remembered between recordings.
 - **Download** individual files (direct from S3 via pre-signed URLs) or **all filtered results as a zip**.
 - **Admin** accounts come from `.env`; admins create normal **users** stored (hashed) in `users.json`.
+- **Share a single meeting.** Besides whole departments, an admin can grant one
+  **specific meeting** from *any* department — including one the user cannot
+  otherwise browse — and choose per meeting whether it is view-only or
+  downloadable. See section 5.
 - **Audit logs** give admins a searchable history of logins, searches, previews,
   downloads, index refreshes, and user-management changes. Activity is stored in
   SQLite (`audit.db`) and displayed in the browser's local timezone.
@@ -154,7 +158,39 @@ Add HTTPS (443 + a certificate, e.g. Caddy or certbot) before any public use.
 
 ---
 
-## 5. How it works (quick map)
+## 5. Sharing one meeting (not a whole department)
+
+Department grants are all-or-nothing. When someone needs exactly **one**
+interview — a hiring manager reviewing a single candidate, say — open **Admin →
+the user → Shared meetings**, search by meeting ID, candidate, company or date,
+and add it. The picker searches **every** department, because that is precisely
+when you need to reach outside one.
+
+Each shared meeting carries its own permission:
+
+- **unticked "Download"** → they can stream it in the browser, nothing else
+  (the row shows a `view only` tag on the search page and cannot be zipped);
+- **ticked** → they can download it, even if the account is view-only elsewhere.
+
+How it combines with the department grant:
+
+| The user has | They can reach |
+|---|---|
+| Departments only | everything in those departments (existing behaviour) |
+| A shared meeting only | exactly that meeting's files — video, audio, transcript, chat |
+| Both | the union; download is decided per file, most permissive route wins |
+
+Two things worth knowing:
+
+- **A recurring Zoom meeting ID covers every session booked under it.** Zoom
+  reuses one id across occurrences, so granting it shares them all. The picker
+  flags this with an `⚠ N sessions` badge before you save.
+- **A shared meeting survives a department change.** Un-ticking the department it
+  lives in does not revoke it; remove the chip to do that.
+
+---
+
+## 6. How it works (quick map)
 
 | File | Role |
 |------|------|
@@ -224,7 +260,12 @@ print(boto3.client('s3',region_name=os.environ['AWS_REGION'])\
   captions button. Very large transcripts are served straight from S3 rather than
   proxied, and the browser will refuse those as a subtitle track; the button for
   such a track is disabled rather than left silently dead.
-- Audit events are retained for 180 days by default. Set
+- Audit events are retained for 180 days by default.
+- **Shared meetings are additive and stand alone.** Un-ticking a department does
+  *not* revoke a meeting shared from it — otherwise saving a row would silently
+  undo the sharing. Remove the meeting chip to revoke it.
+- Audit events for `user_create` / `user_update` record which meeting IDs were
+  granted and which of them carried download rights. Set
   `AUDIT_RETENTION_DAYS=0` to disable age-based cleanup. A video `view` event means
   the preview was opened; direct-to-S3 playback does not prove watch duration.
   `AUDIT_MAX_ROWS` also caps retained events (default 100,000) so the database

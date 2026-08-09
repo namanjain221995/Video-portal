@@ -94,6 +94,140 @@
     return out;
   }
 
+  // ── Individually shared meetings ───────────────────────────────────────────
+  // A department grant is all-or-nothing; this shares ONE meeting (every file of
+  // it) with someone who should not get the whole department, with its own
+  // view/download choice. Grants are stored as { meeting_id, can_download }.
+  function meetingLabel(detail, meetingId) {
+    if (!detail) return "not in the current index";
+    const who = (detail.candidates || []).slice(0, 2).join(", ");
+    const when = (detail.dates || [])[0] || "";
+    const dept = (detail.departments || []).join(", ");
+    const bits = [who, when, dept].filter(Boolean);
+    const files = `${detail.files} file${detail.files === 1 ? "" : "s"}`;
+    return bits.join(" · ") + " · " + files;
+  }
+
+  function renderChips(box) {
+    const grants = box._grants || [];
+    if (!grants.length) {
+      box.innerHTML = '<span class="user-meta">No individual meetings shared.</span>';
+      return;
+    }
+    box.innerHTML = grants.map((g, i) => {
+      const detail = g.detail;
+      // A recurring Zoom id is reused by every session booked under it, so
+      // granting it shares them all. Say so rather than let it surprise anyone.
+      const repeat = detail && detail.occurrences > 1
+        ? `<span class="mg-warn" title="This meeting ID was reused across ${detail.occurrences} sessions — all of them are shared">⚠ ${detail.occurrences} sessions</span>`
+        : "";
+      return `
+        <div class="mg-chip" data-i="${i}">
+          <div class="mg-chip-main">
+            <strong>${esc(g.meeting_id)}</strong> ${repeat}
+            <span class="user-meta">${esc(meetingLabel(detail, g.meeting_id))}</span>
+          </div>
+          <label class="mg-dl" title="Allow downloading this meeting's files">
+            <input type="checkbox" data-dl ${g.can_download ? "checked" : ""}><span>Download</span>
+          </label>
+          <button type="button" class="mg-remove" data-remove title="Stop sharing this meeting">✕</button>
+        </div>`;
+    }).join("");
+
+    box.querySelectorAll(".mg-chip").forEach((chip) => {
+      const i = Number(chip.dataset.i);
+      chip.querySelector("[data-dl]").addEventListener("change", (e) => {
+        box._grants[i].can_download = e.target.checked;
+      });
+      chip.querySelector("[data-remove]").addEventListener("click", () => {
+        box._grants.splice(i, 1);
+        renderChips(box);
+      });
+    });
+  }
+
+  function renderMeetingResults(panel, box, meetings, ready) {
+    if (!meetings.length) {
+      panel.innerHTML = ready
+        ? '<div class="mg-empty">No meetings match that.</div>'
+        : '<div class="mg-empty">The bucket index is still building — try again shortly.</div>';
+      panel.hidden = false;
+      return;
+    }
+    panel.innerHTML = meetings.map((m, i) => `
+      <button type="button" class="mg-result" data-i="${i}">
+        <span class="mg-result-id">${esc(m.meeting_id)}</span>
+        <span class="mg-result-meta">${esc(meetingLabel(m, m.meeting_id))}</span>
+      </button>`).join("");
+    panel.hidden = false;
+    panel.querySelectorAll(".mg-result").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const m = meetings[Number(btn.dataset.i)];
+        const grants = box._grants;
+        if (!grants.some((g) => g.meeting_id === m.meeting_id)) {
+          // Default to view-only: sharing one meeting is usually about letting
+          // someone WATCH it, and download is the choice that needs a deliberate tick.
+          grants.push({ meeting_id: m.meeting_id, can_download: false, detail: m });
+          renderChips(box);
+        }
+        panel.hidden = true;
+      });
+    });
+  }
+
+  function wireMeetingPicker(root, grants) {
+    const input = root.querySelector(".mg-q");
+    const panel = root.querySelector(".mg-results");
+    const box = root.querySelector(".mg-chips");
+    box._grants = (grants || []).map((g) => ({
+      meeting_id: g.meeting_id, can_download: !!g.can_download, detail: g.detail,
+    }));
+    renderChips(box);
+
+    let timer = 0;
+    let seq = 0;
+    input.addEventListener("input", () => {
+      clearTimeout(timer);
+      const q = input.value.trim();
+      if (!q) { panel.hidden = true; return; }
+      // Debounced: each lookup walks the whole index server-side, so a keystroke
+      // per request would put real load on the box for no benefit.
+      timer = setTimeout(async () => {
+        const mine = ++seq;
+        try {
+          const resp = await fetch("/api/admin/meetings?q=" + encodeURIComponent(q));
+          if (mine !== seq) return;            // a newer keystroke won
+          const data = await resp.json();
+          if (mine !== seq) return;
+          if (!resp.ok) { panel.hidden = true; return; }
+          renderMeetingResults(panel, box, data.meetings || [], data.ready !== false);
+        } catch (e) { panel.hidden = true; }
+      }, 300);
+    });
+    document.addEventListener("click", (e) => {
+      if (!panel.hidden && !root.contains(e.target)) panel.hidden = true;
+    });
+  }
+
+  function readMeetingGrants(root) {
+    const box = root.querySelector(".mg-chips");
+    return (box._grants || []).map((g) => ({
+      meeting_id: g.meeting_id, can_download: !!g.can_download,
+    }));
+  }
+
+  // The results panel is anchored to the INPUT, not to the whole widget, or it
+  // would drop below the chip list instead of under what was typed.
+  const MEETING_PICKER_HTML = `
+    <div class="meeting-grant">
+      <div class="mg-search">
+        <input class="input mg-q" type="search" autocomplete="off"
+               placeholder="Find a meeting — ID, candidate, company or date">
+        <div class="mg-results" hidden></div>
+      </div>
+      <div class="mg-chips"></div>
+    </div>`;
+
   // Keep a host container in sync with its department checkboxes (preserving
   // any host ticks already made for departments that stay selected).
   function wireHostSync(deptBox, hostBox) {
@@ -147,6 +281,14 @@
           <div class="user-access">
             <div class="dept-checks user-depts"></div>
             <div class="host-restrict user-hosts"></div>
+            <details class="mg-box user-meetings"${(u.meetings || []).length ? " open" : ""}>
+              <summary>Shared meetings — <span class="host-sum">${
+                (u.meetings || []).length
+                  ? `${u.meetings.length} meeting${u.meetings.length === 1 ? "" : "s"}`
+                  : "none"}</span></summary>
+              <p class="user-meta host-hint">Give access to one meeting on its own, from any department — even one this user cannot otherwise browse.</p>
+              ${MEETING_PICKER_HTML}
+            </details>
             <div class="user-access-actions">
               <select class="input perm-select">
                 <option value="view"${u.can_download ? "" : " selected"}>View only</option>
@@ -167,6 +309,7 @@
       renderDeptChecks(deptBox, users[i].departments || []);
       renderHostBoxes(hostBox, users[i].departments || [], users[i].hosts || {});
       wireHostSync(deptBox, hostBox);
+      wireMeetingPicker(row.querySelector(".user-meetings"), users[i].meetings || []);
       row.querySelector("[data-save]").addEventListener("click", (e) => saveAccess(row, e.currentTarget));
       row.querySelector("[data-del]").addEventListener("click", (e) =>
         deleteUser(row.dataset.user, e.currentTarget));
@@ -177,6 +320,7 @@
     const username = row.dataset.user;
     const departments = readDeptChecks(row.querySelector(".user-depts"));
     const hosts = readHostChecks(row.querySelector(".user-hosts"));
+    const meetings = readMeetingGrants(row.querySelector(".user-meetings"));
     const can_download = row.querySelector(".perm-select").value === "download";
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner"></span>';
@@ -184,7 +328,7 @@
       const resp = await fetch("/api/admin/users/" + encodeURIComponent(username), {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ departments, hosts, can_download }),
+        body: JSON.stringify({ departments, hosts, meetings, can_download }),
       });
       if (resp.status === 401) { location.href = "/login"; return; }
       const data = await resp.json().catch(() => ({}));
@@ -231,6 +375,7 @@
           password: $("new-password").value,
           departments: readDeptChecks($("new-depts")),
           hosts: readHostChecks($("new-hosts")),
+          meetings: readMeetingGrants($("new-meetings")),
           can_download: $("new-perm").value === "download",
         }),
       });
@@ -241,6 +386,7 @@
       $("create-form").reset();
       renderDeptChecks($("new-depts"), []);
       renderHostBoxes($("new-hosts"), [], {});
+      resetMeetingPicker();      // form.reset() cannot clear chips it never owned
       load();
     } catch (e2) {
       showNotice("Network error creating user.", "error");
@@ -250,7 +396,15 @@
     }
   }
 
+  // The create form's picker is built from the same markup as the per-user ones,
+  // so the two can never drift apart.
+  function resetMeetingPicker() {
+    $("new-meetings").innerHTML = MEETING_PICKER_HTML;
+    wireMeetingPicker($("new-meetings"), []);
+  }
+
   $("create-form").addEventListener("submit", createUser);
   wireHostSync($("new-depts"), $("new-hosts"));
+  resetMeetingPicker();
   load();
 })();

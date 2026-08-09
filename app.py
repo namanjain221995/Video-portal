@@ -79,19 +79,48 @@ def admin_required(fn):
 # Access control (authoritative — derived from the session, never the client)
 # ─────────────────────────────────────────────────────────────────────────────
 def _current_access():
-    """What the signed-in user may reach: the list of departments they can browse,
-    an optional per-department host restriction ({dept: [host, …]} — no entry
-    means every host in that department) and whether they may download (vs
-    view-only). Admins get every department, every host and full download rights."""
+    """What the signed-in user may reach:
+
+    * ``departments`` — the department folders they can browse,
+    * ``hosts``       — an optional per-department host restriction
+      ({dept: [host, …]}; no entry means every host in that department),
+    * ``meetings``    — individually shared meetings ({meeting_id: can_download}),
+      which reach that meeting's files wherever they live, on top of the
+      department grant rather than inside it,
+    * ``can_download``— whether they may download within their departments.
+
+    Admins get every department, every host and full download rights, so they
+    need no meeting grants.
+    """
     known = s3_service.all_departments()   # configured + auto-discovered
     if session.get("role") == "admin":
-        return {"departments": list(known), "hosts": {}, "can_download": True}
+        return {"departments": list(known), "hosts": {}, "meetings": {}, "can_download": True}
     info = auth.user_access(session.get("user", ""))
     # Intersect with the departments that actually exist, so a stale grant can't
     # widen access if a department is renamed/removed in config.
     depts = [d for d in info["departments"] if d in known]
     hosts = {d: hs for d, hs in (info.get("hosts") or {}).items() if d in depts and hs}
-    return {"departments": depts, "hosts": hosts, "can_download": bool(info["can_download"])}
+    # Meeting grants are NOT intersected with anything: they are identified by the
+    # meeting id alone and are meant to work outside the department grant.
+    meetings = {str(k): bool(v) for k, v in (info.get("meetings") or {}).items() if k}
+    return {"departments": depts, "hosts": hosts, "meetings": meetings,
+            "can_download": bool(info["can_download"])}
+
+
+def _authorized(key, access):
+    """The indexed record for ``key`` if this caller may reach it, else None.
+
+    Every route that touches a file goes through here so the access rule (a
+    department grant OR an individually shared meeting) is applied identically,
+    and adding a new route cannot accidentally skip half of it."""
+    return s3_service.authorized_record(
+        key, access["departments"], access["hosts"], access["meetings"])
+
+
+def _can_download_anything(access):
+    """Whether to offer download UI at all: either the account may download inside
+    its departments, or at least one shared meeting was granted with download."""
+    return bool(access["can_download"]) or any((access.get("meetings") or {}).values())
 
 
 def _audit(action, record=None, details=None, username=None, role=None,
@@ -159,6 +188,40 @@ def _clean_departments(raw):
             + ". If one was just created in S3, refresh the index and try again."
         )
     return out
+
+
+# A meeting folder in S3 is always all-digit (see _parse_key), so anything else
+# could never match a record. Bounds keep a hostile payload from bloating
+# users.json or the per-request access mask.
+_MEETING_ID_MAX_LEN = 32
+_MEETING_GRANT_MAX = 500
+
+
+def _clean_meetings(raw):
+    """Sanitise an admin-supplied meeting-grant list into
+    [{"meeting_id": str, "can_download": bool}, …].
+
+    Accepts a bare id string or an object, dedupes on the id (the LAST entry
+    wins, so re-adding a meeting to toggle its download flag behaves as expected)
+    and silently drops anything that could not name a real meeting. Unlike
+    departments this does not raise on unknown ids: an id may legitimately be
+    granted before the index has caught up with a just-uploaded recording."""
+    if raw is None:
+        return None                    # key omitted -> leave the grant unchanged
+    if not isinstance(raw, list):
+        return []
+    out = {}
+    for entry in raw[:_MEETING_GRANT_MAX]:
+        if isinstance(entry, str):
+            entry = {"meeting_id": entry}
+        if not isinstance(entry, dict):
+            continue
+        meeting_id = str(entry.get("meeting_id") or "").strip()
+        if not meeting_id.isdigit() or len(meeting_id) > _MEETING_ID_MAX_LEN:
+            continue
+        out[meeting_id] = {"meeting_id": meeting_id,
+                           "can_download": bool(entry.get("can_download", False))}
+    return list(out.values())
 
 
 def _clean_hosts(raw, departments):
@@ -264,7 +327,8 @@ def api_filters():
     try:
         access = _current_access()
         opts = s3_service.filter_options(departments=access["departments"],
-                                         allowed_hosts=access["hosts"])
+                                         allowed_hosts=access["hosts"],
+                                         allowed_meetings=access["meetings"])
         # Show the user's full assigned set (even a department with no files yet),
         # not just the ones that happen to have records.
         opts["departments"] = sorted(access["departments"], key=str.lower)
@@ -272,7 +336,7 @@ def api_filters():
         for d in access["departments"]:
             hbd.setdefault(d, [])          # a department with no files yet -> no hosts
         opts["hosts_by_department"] = hbd
-        opts["can_download"] = access["can_download"]
+        opts["can_download"] = _can_download_anything(access)
         # A cold cache is normal (the index warms in the background), but a FAILED
         # build looks exactly the same from here — empty hosts, ready=false. Pass
         # the reason through so the page can say "credentials expired" instead of
@@ -334,10 +398,17 @@ def api_search():
             **filters,
             allowed_departments=access["departments"],
             allowed_hosts=access["hosts"],
+            allowed_meetings=access["meetings"],
             limit=per_page,
             offset=(page - 1) * per_page,
             sort=sort,
         )
+        # Download is decided per row now that a single meeting can be shared
+        # view-only. Copies, never mutation: `results` holds the shared cached
+        # records and annotating them in place would leak one user's permission
+        # into the next user's response.
+        results = [dict(r, can_download=s3_service.record_downloadable(r, access))
+                   for r in results]
         if any(str(v or "").strip() for v in filters.values()):
             _audit(
                 "search",
@@ -368,7 +439,8 @@ def api_search():
             "pages": max(1, -(-total // per_page)),   # ceil
             "truncated": total > len(results),
             "total_size": total_size,
-            "can_download": access["can_download"],
+            # "may download something" — each row carries its own flag.
+            "can_download": _can_download_anything(access),
             "results": results,
         })
     except Exception as e:
@@ -396,11 +468,14 @@ def api_refresh():
 def api_download_one():
     key = request.args.get("key", "")
     access = _current_access()
-    if not access["can_download"]:
-        abort(403, "Your account is view-only — downloads are disabled.")
-    rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
+    # Authorize the file FIRST, then ask whether this caller may download this
+    # particular one: a meeting can be shared view-only with an account that
+    # downloads freely elsewhere, so the permission is per record, not per user.
+    rec = _authorized(key, access)
     if rec is None:
         abort(404, "File not found.")
+    if not s3_service.record_downloadable(rec, access):
+        abort(403, "This recording is view-only for your account.")
 
     if s3_service.DEMO_MODE:
         data, fname = s3_service.demo_file_response(key)
@@ -427,7 +502,7 @@ def api_view_one():
     including view-only accounts that may not use /api/download."""
     key = request.args.get("key", "")
     access = _current_access()
-    rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
+    rec = _authorized(key, access)
     if rec is None:
         abort(404, "File not found.")
 
@@ -486,12 +561,12 @@ def api_captions():
     named, so this can never disclose a file the caller may not open."""
     key = request.args.get("key", "")
     access = _current_access()
-    if s3_service.authorized_record(key, access["departments"], access["hosts"]) is None:
+    if _authorized(key, access) is None:
         abort(404, "File not found.")
 
     tracks = []
     for rec in s3_service.caption_records(key):
-        if s3_service.authorized_record(rec["key"], access["departments"], access["hosts"]) is None:
+        if _authorized(rec["key"], access) is None:
             continue
         tracks.append({
             "label": _CAPTION_TRACK_LABELS.get(
@@ -506,7 +581,7 @@ def api_captions():
 @login_required
 def api_download_bulk():
     access = _current_access()
-    if not access["can_download"]:
+    if not _can_download_anything(access):
         return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
     data = request.get_json(silent=True)
     if request.is_json and not isinstance(data, dict):
@@ -515,15 +590,29 @@ def api_download_bulk():
         data = {}
     submitted_keys = data.get("keys") or []
     records = []
+    view_only = 0
     seen_keys = set()
     if isinstance(submitted_keys, list):
         for key in submitted_keys:
             if not isinstance(key, str) or key in seen_keys:
                 continue
-            rec = s3_service.authorized_record(key, access["departments"], access["hosts"])
-            if rec is not None:
-                seen_keys.add(rec["key"])
+            rec = _authorized(key, access)
+            if rec is None:
+                continue
+            seen_keys.add(rec["key"])
+            # A selection may legitimately mix downloadable and view-only files
+            # now that meetings can be shared view-only. Count them rather than
+            # dropping them silently — a zip that is quietly short of what the
+            # user selected is worse than a refusal that says why.
+            if s3_service.record_downloadable(rec, access):
                 records.append(rec)
+            else:
+                view_only += 1
+    if view_only:
+        return jsonify({
+            "error": f"{view_only} of the selected file(s) are view-only for your "
+                     "account and cannot be zipped. Deselect them and try again."
+        }), 403
     keys = [rec["key"] for rec in records]
     if not keys:
         return jsonify({"error": "No files selected."}), 400
@@ -597,12 +686,41 @@ def api_users_list():
     # hosts_by_department drives the admin host pickers (non-blocking: empty
     # lists while the index is still warming, filled on the next load).
     opts = s3_service.filter_options()
+    users = auth.list_users()
+    # Annotate each shared meeting with what it actually is, so the admin sees
+    # "96355112813 · Akhilendra · Interview-Success" instead of a bare number
+    # they have no way to check. One index pass covers every user at once.
+    granted_ids = {m["meeting_id"] for u in users for m in u.get("meetings") or []}
+    details = s3_service.meeting_details(granted_ids) if granted_ids else {}
+    for user in users:
+        for meeting in user.get("meetings") or []:
+            meeting["detail"] = details.get(meeting["meeting_id"])
     return jsonify({
         "admins": sorted(auth.get_admins().keys(), key=str.lower),
-        "users": auth.list_users(),
+        "users": users,
         "departments": s3_service.all_departments(),
         "hosts_by_department": opts.get("hosts_by_department", {}),
     })
+
+
+@app.route("/api/admin/meetings", methods=["GET"])
+@admin_required
+def api_admin_meetings():
+    """Find meetings to share individually, across every department.
+
+    Admin-only and intentionally unscoped: an admin already sees the whole
+    bucket, and choosing a meeting to hand to someone is precisely the moment
+    they need to look outside a single department. Returns one row per meeting id
+    with enough context (candidates, dates, department, file count) that the
+    admin can tell two similar sessions apart — and an `occurrences` count, since
+    a recurring Zoom id covers every session that reused it."""
+    query = request.args.get("q", "")
+    limit = max(1, min(_int_arg("limit", s3_service.MEETING_LOOKUP_LIMIT), 50))
+    try:
+        meetings = s3_service.meeting_summaries(query, limit=limit)
+    except Exception as e:
+        return jsonify({"error": _s3_err(e)}), 502
+    return jsonify({"meetings": meetings, "ready": s3_service.is_ready()})
 
 
 @app.route("/api/admin/users", methods=["POST"])
@@ -618,17 +736,21 @@ def api_users_create():
     except _BadDepartments as e:
         return jsonify({"error": str(e)}), 400
     try:
+        meetings = _clean_meetings(data.get("meetings")) or []
         auth.create_user(
             data.get("username", ""), data.get("password", ""),
             created_by=session.get("user", ""),
             departments=departments,
             hosts=_clean_hosts(data.get("hosts"), departments),
             can_download=bool(data.get("can_download", False)),
+            meetings=meetings,
         )
         _audit("user_create", details={
             "target_user": str(data.get("username", "")),
             "departments": departments,
             "can_download": bool(data.get("can_download", False)),
+            "meetings": [m["meeting_id"] for m in meetings],
+            "meetings_downloadable": [m["meeting_id"] for m in meetings if m["can_download"]],
         })
         return jsonify({"ok": True})
     except ValueError as e:
@@ -657,13 +779,17 @@ def api_users_update(username):
             else auth.user_access(username)["departments"]
         hosts = _clean_hosts(data.get("hosts"), target)
     can_download = bool(data["can_download"]) if "can_download" in data else None
+    meetings = _clean_meetings(data.get("meetings")) if "meetings" in data else None
     try:
         auth.update_user_access(username, departments=departments, hosts=hosts,
-                                can_download=can_download)
+                                can_download=can_download, meetings=meetings)
         _audit("user_update", details={
             "target_user": username,
             "departments": departments,
             "can_download": can_download,
+            "meetings": None if meetings is None else [m["meeting_id"] for m in meetings],
+            "meetings_downloadable": None if meetings is None else
+                [m["meeting_id"] for m in meetings if m["can_download"]],
         })
         return jsonify({"ok": True})
     except ValueError as e:
@@ -761,7 +887,7 @@ def api_log_capture():
     key = data.get("key")
     if isinstance(key, str) and key:
         access = _current_access()
-        if s3_service.key_allowed(key, access["departments"], access["hosts"]):
+        if _authorized(key, access) is not None:
             rec = s3_service.record_for_key(key)
             extra["resource_key"] = key            # per-recording dedupe
     _audit(kind, record=rec, details=details, dedupe_seconds=10, **extra)
