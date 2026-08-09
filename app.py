@@ -273,7 +273,14 @@ def api_filters():
             hbd.setdefault(d, [])          # a department with no files yet -> no hosts
         opts["hosts_by_department"] = hbd
         opts["can_download"] = access["can_download"]
-        opts["cache"] = s3_service.cache_info()
+        # A cold cache is normal (the index warms in the background), but a FAILED
+        # build looks exactly the same from here — empty hosts, ready=false. Pass
+        # the reason through so the page can say "credentials expired" instead of
+        # spinning on "indexing bucket…" forever.
+        cache = s3_service.cache_info()
+        if cache.get("error"):
+            cache["error"] = _s3_err(cache["error"])
+        opts["cache"] = cache
         return jsonify(opts)
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
@@ -762,7 +769,10 @@ def api_log_capture():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-def _s3_err(e: Exception) -> str:
+def _s3_err(e) -> str:
+    """Turn an S3/boto failure into something the person reading it can act on.
+    Accepts an exception or an already-stringified message (cache_info stores the
+    latter), since both funnel to the same user-facing text."""
     msg = str(e)
     if any(t in msg for t in ("ExpiredToken", "ExpiredTokenException", "InvalidClientTokenId", "RequestExpired", "token has expired")):
         return "AWS session credentials have expired. Refresh the STS/IAM credentials (or restart the service) and try again."

@@ -146,6 +146,11 @@ _cache = {"records": None, "by_key": None, "by_meeting": None, "options": None, 
 # only — see the note in _store() for why a department must not become unknown
 # again once discovered.
 _seen_departments = set()
+# Why the last index build failed, or None (guarded by _lock). Without this a
+# failed build is indistinguishable from a slow one: filter_options() returns
+# empty lists either way, so the UI would sit on "indexing bucket…" forever with
+# an empty Host dropdown and never say that the credentials had expired.
+_index_error = None
 _s3 = None
 
 
@@ -755,10 +760,20 @@ def get_records(force: bool = False):
 
         # Prefer the cheap shared disk index; only re-list S3 when it is stale
         # (older than INDEX_TTL) or an explicit refresh was requested.
+        global _index_error
         records = None if force else _load_disk_index(INDEX_TTL)
         if records is None:
-            records = _rebuild_from_s3(force)
+            try:
+                records = _rebuild_from_s3(force)
+            except Exception as e:
+                # Remember WHY, then re-raise: callers still fail as before, but a
+                # page that only reads the cache can now report the real reason.
+                with _lock:
+                    _index_error = str(e)
+                raise
 
+        with _lock:
+            _index_error = None
         _store(records)
         return records
 
@@ -779,8 +794,11 @@ def cache_info():
         age = time.time() - _cache["ts"] if ready else None
         count = len(_cache["records"]) if ready else 0
         rosters = (_cache["options"] or {}).get("rosters", 0)
+        error = _index_error
     return {"demo": False, "count": count, "rosters": rosters,
-            "age_sec": round(age) if age is not None else None, "ready": ready}
+            "age_sec": round(age) if age is not None else None, "ready": ready,
+            # Raw message; the caller translates it into something actionable.
+            "error": error}
 
 
 def _records_by_key():

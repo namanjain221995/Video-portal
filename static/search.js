@@ -193,7 +193,15 @@
   function setCacheInfo(cache) {
     if (!cache) return;
     const el = $("cache-info");
+    el.className = "cache-info";
     if (cache.demo) { el.textContent = `${cache.count} demo records`; return; }
+    // A failed build must not masquerade as a slow one: without this the page
+    // shows "indexing bucket…" and an empty Host list indefinitely.
+    if (cache.error) {
+      el.className = "cache-info cache-error";
+      el.textContent = cache.ready ? "index may be stale" : "index unavailable";
+      return;
+    }
     if (!cache.ready) { el.textContent = "indexing bucket…"; return; }
     const age = cache.age_sec == null ? "—" : `${cache.age_sec}s ago`;
     el.textContent = `${cache.count} files · indexed ${age}`;
@@ -219,8 +227,18 @@
       refreshHostOptions();   // scope Host to the (possibly preselected) department
 
       setCacheInfo(data.cache);
-      // On a cold boot the index is still warming; hosts arrive on a quiet retry.
-      if (data.cache && data.cache.ready === false) setTimeout(loadFilters, 4000);
+      const cache = data.cache || {};
+      if (cache.error) {
+        // The Host dropdown is empty because the index could not be built — say
+        // so loudly, and stop the quiet retry loop: this needs a human (usually
+        // refreshed AWS credentials), not another poll.
+        showNotice("Recordings can't be listed: " + cache.error +
+                   " Hosts and search results stay empty until this is fixed — " +
+                   "then use ↻ Refresh index.", "error");
+      } else if (cache.ready === false) {
+        // On a cold boot the index is still warming; hosts arrive on a quiet retry.
+        setTimeout(loadFilters, 4000);
+      }
     } catch (e) {
       showNotice("Network error loading filters — is the server running?", "error");
     }

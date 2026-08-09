@@ -175,6 +175,31 @@ index** button.
 > first boot after deploying that change re-lists the bucket once (a few minutes
 > for ~80k objects) instead of serving records with no Time column.
 
+### "The Host dropdown is empty and it says *indexing bucket…* forever"
+
+Every dropdown is built from the index, so **no index means no hosts**. The
+indicator next to *Refresh index* tells you which case you are in:
+
+| Indicator | Meaning |
+|---|---|
+| `115,657 files · indexed 42s ago` | healthy |
+| `indexing bucket…` | still building — hosts appear on their own within a few minutes |
+| `index unavailable` (red) + a red banner | the build **failed**; the banner names the reason |
+
+The usual cause of a failure is **expired AWS credentials**. Temporary STS keys
+(the ones starting `ASIA…`) last hours, so a portal that worked yesterday will
+fail today with `ExpiredToken`. Refresh them in `.env` and click **↻ Refresh
+index** — or, on EC2, attach the instance role (section 3b) so credentials are
+rotated automatically and this cannot happen at all.
+
+Quick check from the server:
+
+```bash
+python -c "import boto3,os;from dotenv import load_dotenv;load_dotenv();\
+print(boto3.client('s3',region_name=os.environ['AWS_REGION'])\
+.list_objects_v2(Bucket=os.environ['S3_BUCKET_NAME'],Prefix='HR/',MaxKeys=1)['KeyCount'])"
+```
+
 ### Notes / limits
 - **Bulk zip** streams each object through the app (uses EC2 bandwidth). Fine
   for a handful of files; for very large multi-GB selections prefer individual
