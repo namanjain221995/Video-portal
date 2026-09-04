@@ -415,7 +415,41 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 .mg-result-id { font-size: 13px; font-weight: 700; color: var(--brand-dk); }
 .mg-result-meta { font-size: 12px; color: var(--ink-soft); }
 .mg-empty { padding: 12px; font-size: 12.5px; color: var(--muted); }
-.mg-chips { display: flex; flex-direction: column; gap: 6px; margin-top: 9px; }
+/* A pasted id that the index does not know yet: still shareable, but it must not
+   read as an ordinary resolved result. */
+.mg-result-missing .mg-result-id { color: var(--warn); }
+.mg-result-missing .mg-result-meta { color: var(--muted); }
+/* Sticky so "Add all N" stays reachable while scrolling 40 pasted rows inside
+   the panel's own 260px max-height. */
+.mg-bulk-head {
+  position: sticky; top: 0; z-index: 1;
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 12px; background: var(--brand-soft);
+  border-bottom: 1px solid var(--line-2);
+}
+.mg-bulk-count { flex: 1 1 auto; font-size: 12.5px; color: var(--ink-soft); }
+.mg-bulk-note {
+  padding: 8px 12px; font-size: 12px; line-height: 1.5; color: var(--warn);
+  background: var(--warn-soft); border-bottom: 1px solid var(--line);
+}
+.mg-bulk-actions {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding-bottom: 3px;
+}
+.mg-bulk-actions .user-meta { flex: 1 1 auto; }
+.mg-bulk-btn {
+  border: 1px solid var(--line-2); background: #fff; border-radius: 7px;
+  padding: 4px 9px; font-family: inherit; font-size: 12px; font-weight: 600;
+  color: var(--ink-soft); cursor: pointer;
+}
+.mg-bulk-btn:hover { background: var(--brand-soft); border-color: var(--brand); }
+.mg-bulk-danger { color: var(--danger); }
+.mg-bulk-danger:hover { background: var(--danger-soft); border-color: var(--danger); }
+/* Capped: a pasted batch of 40 meetings would otherwise push Save off-screen. */
+.mg-chips {
+  display: flex; flex-direction: column; gap: 6px; margin-top: 9px;
+  max-height: 320px; overflow-y: auto;
+}
 .mg-chip {
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
   background: #fff; border: 1px solid var(--line-2); border-radius: 9px;

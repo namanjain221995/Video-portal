@@ -392,6 +392,276 @@ class AdminMeetingApiTests(unittest.TestCase):
         self.assertIsNone(portal._clean_meetings(None))
         self.assertEqual(portal._clean_meetings("nonsense"), [])
 
+    def test_the_grant_cap_counts_distinct_ids_not_payload_entries(self):
+        """Slicing the payload before deduping meant 500 entries carrying 200
+        repeats produced only 300 grants — a limit nobody asked for, and one a
+        pasted list makes easy to hit by accident."""
+        payload = [{"meeting_id": str(i)} for i in range(1, portal._MEETING_GRANT_MAX + 1)]
+        payload += payload[:100]                       # 100 duplicates on the end
+        self.assertEqual(len(portal._clean_meetings(payload)), portal._MEETING_GRANT_MAX)
+
+
+class PastedIdParsingTests(unittest.TestCase):
+    """_split_meeting_ids — the parser behind pasting a whole list of ids.
+
+    Its contract is that NOTHING is dropped silently: every token an admin pasted
+    comes back as an id, as invalid, or inside the truncation flag. An admin who
+    pastes 40 ids and quietly gets 38 grants has no way to tell which two went
+    missing or why, which is exactly the failure this replaces.
+    """
+
+    def test_a_pasted_comma_list_becomes_every_id(self):
+        ids, invalid, truncated = portal._split_meeting_ids(
+            "94601720227, 93490389605, 91455796944, 95803214878")
+        self.assertEqual(ids, ["94601720227", "93490389605",
+                               "91455796944", "95803214878"])
+        self.assertEqual((invalid, truncated), ([], False))
+
+    def test_every_separator_an_admin_can_paste_is_accepted(self):
+        """A spreadsheet column arrives with newlines and tabs, a Slack message
+        with commas and spaces, a mail client with semicolons, and a copy made in
+        some locales carries a fullwidth comma (U+FF0C) or ideographic space
+        (U+3000). Written as chr() so no invisible character sits in this file."""
+        pasted = ("111\n222\t333, 444 555;666|777"
+                  + chr(0x3000) + "888" + chr(0xFF0C) + "999")
+        ids, invalid, _ = portal._split_meeting_ids(pasted)
+        self.assertEqual(ids, ["111", "222", "333", "444", "555",
+                               "666", "777", "888", "999"])
+        self.assertEqual(invalid, [])
+
+    def test_duplicates_collapse_and_the_pasted_order_is_kept(self):
+        ids, _, _ = portal._split_meeting_ids("222, 111, 222, 333")
+        self.assertEqual(ids, ["222", "111", "333"])
+
+    def test_a_typod_id_is_reported_whole_not_split_into_two(self):
+        """The trap this parser exists to avoid: splitting on 'anything that is
+        not a digit' would turn 9460172O227 (capital O) into 9460172 and 227 and
+        share two meetings nobody asked for."""
+        ids, invalid, _ = portal._split_meeting_ids("9460172O227, 123")
+        self.assertEqual(ids, ["123"])
+        self.assertEqual(invalid, ["9460172O227"])
+
+    def test_oversized_and_non_ascii_digits_are_rejected(self):
+        arabic_indic = chr(0x661) + chr(0x662) + chr(0x663)
+        ids, invalid, _ = portal._split_meeting_ids(
+            "9" * (portal._MEETING_ID_MAX_LEN + 1) + " " + arabic_indic + " 456")
+        self.assertEqual(ids, ["456"])
+        self.assertEqual(len(invalid), 2)
+
+    def test_zero_width_characters_between_ids_still_separate_them(self):
+        """A copy out of Slack, Notion or Word carries a zero-width space, word
+        joiner or BOM. \\s matches none of them, so without these two ids fuse
+        into one token that resolves to nothing."""
+        for code in (0x200B, 0xFEFF, 0x2060):
+            ids, invalid, _ = portal._split_meeting_ids("111" + chr(code) + "222")
+            self.assertEqual((ids, invalid), (["111", "222"], []), hex(code))
+
+    def test_wrapping_punctuation_from_a_copied_cell_is_trimmed(self):
+        ids, invalid, _ = portal._split_meeting_ids(
+            '"94601720227", [93490389605], (91455796944)')
+        self.assertEqual(ids, ["94601720227", "93490389605", "91455796944"])
+        self.assertEqual(invalid, [])
+
+    def test_trimming_never_reaches_inside_a_token(self):
+        """Only the outside is trimmed, so a typo'd id is still reported whole
+        rather than quietly repaired into some other real meeting."""
+        ids, invalid, _ = portal._split_meeting_ids('"9460172O227"')
+        self.assertEqual((ids, invalid), ([], ["9460172O227"]))
+
+    def test_a_json_list_payload_is_accepted_too(self):
+        self.assertEqual(portal._split_meeting_ids(["1", 2, "x"])[0], ["1", "2"])
+
+    def test_a_paste_past_the_cap_is_truncated_and_says_so(self):
+        ids, _, truncated = portal._split_meeting_ids("1 2 3 4 5 6 7", limit=5)
+        self.assertEqual(len(ids), 5)
+        self.assertTrue(truncated)
+
+    def test_nothing_in_means_nothing_out(self):
+        for value in ("", "   ", None, [], ",,,"):
+            self.assertEqual(portal._split_meeting_ids(value), ([], [], False), value)
+
+
+class BulkMeetingLookupTests(unittest.TestCase):
+    """POST /api/admin/meetings/lookup — resolving a pasted list of ids at once."""
+
+    def setUp(self):
+        self.client = portal.app.test_client()
+        with self.client.session_transaction() as session:
+            session["user"] = "bulk-admin"
+            session["role"] = "admin"
+
+    def post(self, ids):
+        return self.client.post("/api/admin/meetings/lookup", json={"ids": ids})
+
+    def test_a_pasted_list_resolves_every_id_in_one_call(self):
+        data = self.post("%s, %s, %s" % (GROUP_MEETING, QMS_MEETING, HR_MEETING)).get_json()
+        self.assertEqual([m["meeting_id"] for m in data["meetings"]],
+                         [GROUP_MEETING, QMS_MEETING, HR_MEETING])
+        self.assertEqual(data["missing"], [])
+        self.assertEqual(data["invalid"], [])
+        self.assertFalse(data["truncated"])
+
+    def test_resolution_is_exact_never_substring(self):
+        """The property that stops this over-sharing. '9635' is a prefix of
+        several demo meetings and the free-text search DOES match them all — but a
+        pasted id must resolve only to the meeting that IS that id, or an admin
+        who fat-fingers one would hand over every meeting sharing the prefix."""
+        self.assertGreater(len(s3_service.meeting_summaries("9635")), 1)
+        data = self.post("9635").get_json()
+        self.assertEqual(data["meetings"], [])
+        self.assertEqual(data["missing"], ["9635"])
+
+    def test_an_unknown_id_is_reported_missing_not_dropped(self):
+        data = self.post("%s 00000000000" % GROUP_MEETING).get_json()
+        self.assertEqual([m["meeting_id"] for m in data["meetings"]], [GROUP_MEETING])
+        self.assertEqual(data["missing"], ["00000000000"])
+
+    def test_a_junk_token_comes_back_named(self):
+        data = self.post("%s, not-an-id" % GROUP_MEETING).get_json()
+        self.assertEqual(data["invalid"], ["not-an-id"])
+        self.assertEqual([m["meeting_id"] for m in data["meetings"]], [GROUP_MEETING])
+
+    def test_the_order_pasted_is_the_order_returned(self):
+        data = self.post("%s,%s" % (HR_MEETING, GROUP_MEETING)).get_json()
+        self.assertEqual([m["meeting_id"] for m in data["meetings"]],
+                         [HR_MEETING, GROUP_MEETING])
+
+    def test_a_paste_past_the_cap_is_capped_and_flagged(self):
+        blob = " ".join(str(1000000 + i) for i in range(portal._MEETING_GRANT_MAX + 10))
+        data = self.post(blob).get_json()
+        self.assertTrue(data["truncated"])
+        self.assertEqual(len(data["missing"]), portal._MEETING_GRANT_MAX)
+        self.assertEqual(data["limit"], portal._MEETING_GRANT_MAX)
+
+    def test_a_bodyless_post_is_empty_rather_than_a_500(self):
+        resp = self.client.post("/api/admin/meetings/lookup")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.get_json()["meetings"], [])
+
+    def test_it_is_closed_to_normal_users(self):
+        client = portal.app.test_client()
+        with client.session_transaction() as session:
+            session["user"] = "nobody"
+            session["role"] = "user"
+        self.assertEqual(
+            client.post("/api/admin/meetings/lookup", json={"ids": "1"}).status_code, 403)
+
+
+class PastedGrantEndToEndTests(unittest.TestCase):
+    """The user-visible promise: pasting many ids actually GRANTS all of them.
+
+    Everything above tests a layer; this tests that the layers add up, because the
+    bug being fixed was precisely a stack where every individual piece worked and
+    the admin still ended up with an account that had no shared meetings.
+    """
+
+    def setUp(self):
+        patcher = mock.patch.object(auth, "USERS_FILE", _USERS_PATH)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        if os.path.exists(_USERS_PATH):
+            os.unlink(_USERS_PATH)
+        self.client = portal.app.test_client()
+        with self.client.session_transaction() as session:
+            session["user"] = "bulk-admin"
+            session["role"] = "admin"
+
+    PASTED = "%s, %s\n%s" % (GROUP_MEETING, QMS_MEETING, HR_MEETING)
+
+    def test_creating_a_user_from_a_pasted_batch_grants_every_meeting(self):
+        ids, invalid, _ = portal._split_meeting_ids(self.PASTED)
+        self.assertEqual(invalid, [])
+        resp = self.client.post("/api/admin/users", json={
+            "username": "batch", "password": "pw", "departments": [],
+            "can_download": False,
+            "meetings": [{"meeting_id": i, "can_download": False} for i in ids],
+        })
+        self.assertEqual(resp.status_code, 200)
+
+        access = auth.user_access("batch")
+        self.assertEqual(set(access["meetings"]), set(ids))
+        # Every file of every pasted meeting is reachable with no department at all…
+        for meeting_id in ids:
+            _, total, _ = s3_service.search(limit=1000, allowed_departments=[],
+                                            allowed_meetings=access["meetings"],
+                                            meeting_id=meeting_id)
+            self.assertEqual(total, len(files_for(meeting_id)), meeting_id)
+        # …and nothing beyond them leaked in with the batch.
+        rows, _, _ = s3_service.search(limit=1000, allowed_departments=[],
+                                       allowed_meetings=access["meetings"], date="20")
+        self.assertEqual({r["meeting_id"] for r in rows}, set(ids))
+
+    def test_pasting_a_batch_onto_an_existing_user_adds_them_all(self):
+        auth.create_user("grower", "pw", departments=["QMS"])
+        ids, _, _ = portal._split_meeting_ids("%s %s" % (GROUP_MEETING, HR_MEETING))
+        resp = self.client.patch("/api/admin/users/grower", json={
+            "meetings": [{"meeting_id": i, "can_download": True} for i in ids]})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(auth.user_access("grower")["meetings"],
+                         {GROUP_MEETING: True, HR_MEETING: True})
+
+    def test_an_id_the_index_does_not_know_is_still_stored(self):
+        """A recording uploaded minutes ago is not indexed yet. Refusing its id
+        would make an admin wait for a scan before they could share it, and the
+        grant costs nothing until the files show up."""
+        self.client.post("/api/admin/users", json={
+            "username": "early", "password": "pw", "departments": [],
+            "meetings": [{"meeting_id": "00000000000", "can_download": False}]})
+        self.assertEqual(auth.user_access("early")["meetings"], {"00000000000": False})
+
+    def test_a_string_of_ids_is_refused_instead_of_wiping_every_grant(self):
+        """PATCH REPLACES the meeting list, and a non-list value cleans to [] —
+        so {"meetings": "94601720227,93490389605"}, the exact string an admin
+        pastes, used to revoke every share and answer {"ok": true}."""
+        auth.create_user("keeper", "pw", departments=[],
+                         meetings=[{"meeting_id": GROUP_MEETING, "can_download": True}])
+        resp = self.client.patch("/api/admin/users/keeper",
+                                 json={"meetings": "%s,%s" % (QMS_MEETING, HR_MEETING)})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("list", resp.get_json()["error"].lower())
+        # The grant it already had is untouched.
+        self.assertEqual(auth.user_access("keeper")["meetings"], {GROUP_MEETING: True})
+
+    def test_more_meetings_than_the_cap_is_refused_not_silently_trimmed(self):
+        """Storing 500 of 600 behind a green "Saved" is the same class of silent
+        loss as the paste that started all this."""
+        payload = [{"meeting_id": str(1000000 + i)}
+                   for i in range(portal._MEETING_GRANT_MAX + 10)]
+        auth.create_user("capped", "pw", departments=[])
+        resp = self.client.patch("/api/admin/users/capped", json={"meetings": payload})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn(str(portal._MEETING_GRANT_MAX), resp.get_json()["error"])
+        self.assertEqual(auth.user_access("capped")["meetings"], {})
+
+        resp = self.client.post("/api/admin/users", json={
+            "username": "capped2", "password": "pw", "departments": [],
+            "meetings": payload})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_exactly_the_cap_still_saves(self):
+        payload = [{"meeting_id": str(1000000 + i)}
+                   for i in range(portal._MEETING_GRANT_MAX)]
+        auth.create_user("atcap", "pw", departments=[])
+        resp = self.client.patch("/api/admin/users/atcap", json={"meetings": payload})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(auth.user_access("atcap")["meetings"]),
+                         portal._MEETING_GRANT_MAX)
+
+    def test_a_batch_grant_is_written_to_the_audit_log(self):
+        """Handing someone 3 meetings at once is exactly the event an audit needs
+        to name individually, not summarise as 'user_create'."""
+        ids, _, _ = portal._split_meeting_ids(self.PASTED)
+        with mock.patch.object(portal, "_audit") as audited:
+            self.client.post("/api/admin/users", json={
+                "username": "logged", "password": "pw", "departments": [],
+                "meetings": [{"meeting_id": i, "can_download": False} for i in ids]})
+        kwargs = audited.call_args.kwargs
+        self.assertEqual(kwargs["details"]["meetings"], ids)
+        # The count as well as the list: audit_service truncates a long list at 50
+        # items, which is exactly the size a pasted batch reaches.
+        self.assertEqual(kwargs["details"]["meetings_count"], len(ids))
+        self.assertEqual(kwargs["details"]["meetings_downloadable_count"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

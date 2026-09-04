@@ -9,6 +9,7 @@ Run locally:
 #
 import io
 import os
+import re
 import functools
 
 from dotenv import load_dotenv
@@ -196,6 +197,72 @@ def _clean_departments(raw):
 _MEETING_ID_MAX_LEN = 32
 _MEETING_GRANT_MAX = 500
 
+# ASCII digits only, deliberately: str.isdigit() also says yes to Arabic-Indic
+# digits and to superscripts like "²", none of which can ever name an S3
+# folder, so accepting them would only put ids in users.json that are guaranteed
+# to match nothing.
+_MEETING_ID_RE = re.compile(r"\A[0-9]{1,%d}\Z" % _MEETING_ID_MAX_LEN)
+
+# Admins paste ids straight out of a spreadsheet column, a Slack message or a
+# mail, so the separator is whatever came with them: newlines and tabs, commas
+# and spaces, semicolons, pipes, and the fullwidth comma / ideographic space a
+# copy made in some locales carries. Tokens are split on SEPARATORS ONLY and kept
+# whole — splitting on "anything that is not a digit" would quietly cut a typo'd
+# id ("9460172O227", with a capital O) into two plausible-looking ids and share
+# two meetings nobody asked for, where keeping it whole lets it be reported back
+# to the admin as one rejected token they can see and fix.
+# \s covers tab/CR/LF/NBSP in both Python and JS, but NOT the zero-width space,
+# word joiner or BOM that a copy out of Slack, Notion or a Word document carries.
+# Those matter: without them two ids fuse into one token, which is at least
+# reported here but is exactly the kind of "I pasted it and nothing happened"
+# that this whole change exists to end.
+# The non-ASCII ones are written as escapes rather than pasted in, so no
+# invisible character sits in this file waiting to be deleted by a later edit.
+_MEETING_ID_SPLIT_RE = re.compile("[\\s,;|\uff0c\u3000\u200b\ufeff\u2060]+")
+
+# Wrapping punctuation a copied cell brings with it ("94601720227", [94601720227]).
+# Only the OUTSIDE of a token is trimmed, never its interior, so a typo'd id
+# still comes back whole and rejected rather than quietly repaired into a
+# different, real meeting.
+_MEETING_ID_TRIM_RE = re.compile("""^["'(\\[<]+|["')\\]>]+$""")
+
+# A paste is bounded before it is split: MAX_CONTENT_LENGTH already caps the body
+# at 1 MiB, but splitting a megabyte of prose into tokens to throw nearly all of
+# them away is work nobody asked for.
+_MEETING_PASTE_MAX_CHARS = 64 * 1024
+
+
+def _split_meeting_ids(raw, limit=_MEETING_GRANT_MAX):
+    """Parse pasted text (or a JSON list) into ``(ids, invalid, truncated)``.
+
+    ``ids`` are the unique well-formed ids in the order they were pasted,
+    ``invalid`` the tokens that could never name a meeting folder, and
+    ``truncated`` says the paste ran past what one account may hold. Every token
+    lands in exactly one of those three buckets, because an admin who pastes 40
+    ids and quietly gets 38 grants has no way to tell which two went missing or
+    why — which is the whole failure this parser exists to prevent."""
+    if isinstance(raw, (list, tuple)):
+        # Re-tokenised through the same rule rather than trusted as-is, so a JSON
+        # entry of "1;2" is normalised exactly like the pasted form. One parser.
+        raw = "\n".join(str(t) for t in raw[:5000])
+    text = str(raw or "")[:_MEETING_PASTE_MAX_CHARS]
+    ids, invalid, seen = [], [], set()
+    for token in _MEETING_ID_SPLIT_RE.split(text.strip()):
+        token = _MEETING_ID_TRIM_RE.sub("", token.strip())
+        if not token:
+            continue
+        if not _MEETING_ID_RE.match(token):
+            # Capped and deduped: this report is for a human to read, and someone
+            # pasting a wall of prose should not turn it into a 1000-item string.
+            if token not in invalid and len(invalid) < 25:
+                invalid.append(token)
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        ids.append(token)
+    return ids[:limit], invalid, len(ids) > limit
+
 
 def _clean_meetings(raw):
     """Sanitise an admin-supplied meeting-grant list into
@@ -205,23 +272,70 @@ def _clean_meetings(raw):
     wins, so re-adding a meeting to toggle its download flag behaves as expected)
     and silently drops anything that could not name a real meeting. Unlike
     departments this does not raise on unknown ids: an id may legitimately be
-    granted before the index has caught up with a just-uploaded recording."""
+    granted before the index has caught up with a just-uploaded recording.
+
+    The cap counts DISTINCT ids rather than slicing the incoming list: slicing
+    first meant a payload of 500 entries carrying 200 duplicates yielded only 300
+    grants — a limit nobody asked for, and one that pasting a list of ids makes
+    easy to hit by accident."""
+    return _clean_meetings_report(raw)[0]
+
+
+def _clean_meetings_report(raw):
+    """``_clean_meetings`` plus how many distinct valid grants ran past the cap,
+    as ``(grants, over_cap)``. The write path needs that count so it can refuse
+    instead of storing a silently shorter list than the admin asked for."""
     if raw is None:
-        return None                    # key omitted -> leave the grant unchanged
+        return None, 0                 # key omitted -> leave the grant unchanged
     if not isinstance(raw, list):
-        return []
+        return [], 0
     out = {}
-    for entry in raw[:_MEETING_GRANT_MAX]:
+    for entry in raw:
         if isinstance(entry, str):
             entry = {"meeting_id": entry}
         if not isinstance(entry, dict):
             continue
         meeting_id = str(entry.get("meeting_id") or "").strip()
-        if not meeting_id.isdigit() or len(meeting_id) > _MEETING_ID_MAX_LEN:
+        if not _MEETING_ID_RE.match(meeting_id):
             continue
         out[meeting_id] = {"meeting_id": meeting_id,
                            "can_download": bool(entry.get("can_download", False))}
-    return list(out.values())
+    grants = list(out.values())
+    return grants[:_MEETING_GRANT_MAX], max(0, len(grants) - _MEETING_GRANT_MAX)
+
+
+class _BadMeetings(ValueError):
+    """An admin-supplied meeting-grant list could not be stored as it was given."""
+
+
+def _validated_meetings(raw):
+    """``_clean_meetings`` for the WRITE path, refusing where the quiet version
+    would destroy access instead of reporting it.
+
+    A grant list is access control, and PATCH REPLACES it wholesale, so storing
+    less of it than was asked for is never right without saying so. Two ways the
+    quiet version loses grants, both previously answered ``{"ok": true}``:
+
+    * a non-list value — ``{"meetings": "94601720227,93490389605"}``, the exact
+      string an admin pastes — cleans to ``[]`` and wipes every meeting the
+      account had;
+    * more than ``_MEETING_GRANT_MAX`` distinct ids is truncated to the cap, so
+      the tail of a large paste vanishes with nothing said.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        raise _BadMeetings(
+            "Shared meetings must be a list of meeting IDs, not a single string. "
+            "Paste the IDs into the Shared meetings box and they will be split "
+            "for you.")
+    grants, over_cap = _clean_meetings_report(raw)
+    if over_cap:
+        raise _BadMeetings(
+            f"That is {len(grants) + over_cap} shared meetings, and at most "
+            f"{_MEETING_GRANT_MAX} can be shared with one account. Remove "
+            f"{over_cap} and save again — nothing has been changed.")
+    return grants
 
 
 def _clean_hosts(raw, departments):
@@ -723,6 +837,46 @@ def api_admin_meetings():
     return jsonify({"meetings": meetings, "ready": s3_service.is_ready()})
 
 
+@app.route("/api/admin/meetings/lookup", methods=["POST"])
+@admin_required
+def api_admin_meetings_lookup():
+    """Resolve a PASTED LIST of meeting ids in one shot, for the admin picker.
+
+    Separate from the free-text search above because the two answer different
+    questions, and conflating them would hand over recordings nobody asked to
+    share. The search is a SUBSTRING match ("akhilendra", "2026-07", "9635") over
+    the whole index; this matches each id EXACTLY. A pasted "9635" must come back
+    as one unresolved id, never as every 9635xxxxxxx meeting in the bucket.
+
+    POST rather than GET because the payload is a list: gunicorn caps a request
+    line at 4094 bytes by default, which a few hundred pasted ids blow straight
+    through — and the browser would surface that as a bare 414 with nothing
+    useful in it. /api/download/bulk posts its key list for the same reason.
+
+    Every id the admin pasted comes back in exactly one of `meetings` (resolved),
+    `missing` (well-formed but not in the current index — still grantable, since
+    a recording uploaded minutes ago has not been indexed yet) or `invalid` (could
+    never name a meeting folder). Nothing is dropped silently."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        data = {}
+    ids, invalid, truncated = _split_meeting_ids(data.get("ids"))
+    try:
+        details = s3_service.meeting_details(ids) if ids else {}
+    except Exception as e:
+        return jsonify({"error": _s3_err(e)}), 502
+    # Order follows the paste, so the panel reads back in the order it was typed
+    # and the admin can check it against whatever they copied from.
+    return jsonify({
+        "meetings":  [details[mid] for mid in ids if mid in details],
+        "missing":   [mid for mid in ids if mid not in details],
+        "invalid":   invalid,
+        "truncated": truncated,
+        "limit":     _MEETING_GRANT_MAX,
+        "ready":     s3_service.is_ready(),
+    })
+
+
 @app.route("/api/admin/users", methods=["POST"])
 @admin_required
 def api_users_create():
@@ -736,7 +890,7 @@ def api_users_create():
     except _BadDepartments as e:
         return jsonify({"error": str(e)}), 400
     try:
-        meetings = _clean_meetings(data.get("meetings")) or []
+        meetings = _validated_meetings(data.get("meetings")) or []
         auth.create_user(
             data.get("username", ""), data.get("password", ""),
             created_by=session.get("user", ""),
@@ -751,6 +905,12 @@ def api_users_create():
             "can_download": bool(data.get("can_download", False)),
             "meetings": [m["meeting_id"] for m in meetings],
             "meetings_downloadable": [m["meeting_id"] for m in meetings if m["can_download"]],
+            # Scalars as well as the lists: audit_service truncates a long list at
+            # 50 items, and 50 is exactly the boundary a pasted batch crosses — so
+            # without these a big grant loses the record of HOW MANY were shared
+            # on top of which ones.
+            "meetings_count": len(meetings),
+            "meetings_downloadable_count": sum(1 for m in meetings if m["can_download"]),
         })
         return jsonify({"ok": True})
     except ValueError as e:
@@ -779,7 +939,12 @@ def api_users_update(username):
             else auth.user_access(username)["departments"]
         hosts = _clean_hosts(data.get("hosts"), target)
     can_download = bool(data["can_download"]) if "can_download" in data else None
-    meetings = _clean_meetings(data.get("meetings")) if "meetings" in data else None
+    try:
+        meetings = _validated_meetings(data["meetings"]) if "meetings" in data else None
+    except _BadMeetings as e:
+        # 400, not the 404 the ValueError below maps to: the user exists, the
+        # payload is what cannot be stored.
+        return jsonify({"error": str(e)}), 400
     try:
         auth.update_user_access(username, departments=departments, hosts=hosts,
                                 can_download=can_download, meetings=meetings)
@@ -790,6 +955,10 @@ def api_users_update(username):
             "meetings": None if meetings is None else [m["meeting_id"] for m in meetings],
             "meetings_downloadable": None if meetings is None else
                 [m["meeting_id"] for m in meetings if m["can_download"]],
+            # See api_users_create: the lists get truncated at 50, the counts don't.
+            "meetings_count": None if meetings is None else len(meetings),
+            "meetings_downloadable_count": None if meetings is None else
+                sum(1 for m in meetings if m["can_download"]),
         })
         return jsonify({"ok": True})
     except ValueError as e:
