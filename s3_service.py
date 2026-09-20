@@ -648,7 +648,9 @@ def _scan_s3():
 # Bump whenever the record shape or DEPARTMENTS coverage changes: a persisted
 # index with an older schema is rejected, forcing ONE clean re-scan on the first
 # boot after a deploy instead of serving pre-upgrade records for up to INDEX_TTL.
-INDEX_SCHEMA = 5   # 3: nested departments; 4: attendee rosters; 5: meeting start time
+INDEX_SCHEMA = 6   # 3: nested departments; 4: attendee rosters; 5: meeting start time
+                   # 6: category folders split out of a department
+
 
 
 def _load_disk_index(max_age):
