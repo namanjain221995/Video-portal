@@ -502,12 +502,15 @@
   // inside wireMeetingPicker instead added a fresh listener per user row on every
   // load() — and load() runs after each save — so the handlers grew without bound
   // for as long as the admin page stayed open.
+  // Capture phase for the same reason datepicker.js uses it: removing a chip
+  // re-renders .mg-chips, which detaches the ✕ that was clicked, and a
+  // bubble-phase listener would then read that inside click as an outside one.
   document.addEventListener("click", (e) => {
     document.querySelectorAll(".meeting-grant").forEach((root) => {
       const panel = root.querySelector(".mg-results");
       if (panel && !panel.hidden && !root.contains(e.target)) panel.hidden = true;
     });
-  });
+  }, true);
 
   // Keep a host container in sync with its department checkboxes (preserving
   // any host ticks already made for departments that stay selected).

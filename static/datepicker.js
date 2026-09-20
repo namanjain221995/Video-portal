@@ -339,9 +339,18 @@
       commit("", "");
     });
 
+    // Capture phase, deliberately — and this is load-bearing, not a style choice.
+    // Clicking a day re-renders the grid, and renderDays() replaces daysBox's
+    // innerHTML, which destroys the very button that was clicked. A bubble-phase
+    // listener runs AFTER that, by which point e.target is a detached node and
+    // host.contains(e.target) answers false for a click that happened INSIDE the
+    // calendar — so the picker closed on the first click of a range. That made a
+    // range impossible to finish and left the field looking as though it could
+    // only ever hold a single date. Capture runs before the grid is rebuilt,
+    // while the clicked button is still in the tree, so the test is honest.
     document.addEventListener("click", function (e) {
       if (!pop.hidden && !host.contains(e.target)) close();
-    });
+    }, true);
 
     parseTyped();
 
