@@ -170,5 +170,115 @@ class KeyParsingTests(unittest.TestCase):
                     )
 
 
+class MixedParentDepartmentTests(unittest.TestCase):
+    """Interview-Success holds host folders and category folders side by side.
+
+    The bucket looks like this:
+
+        Interview-Success/Agrima_Agarwal/2026/09/…     <- a HOST (a person)
+        Interview-Success/Nitin_Singh/2026/09/…        <- a HOST
+        Interview-Success/Internal-Interview/{Host}/…  <- a SUB-DEPARTMENT
+        Interview-Success/Interview/{Host}/…           <- a SUB-DEPARTMENT
+
+    Before this, every child was read as a host, so a recording inside
+    Internal-Interview/ was filed with host='Internal-Interview', year set to the
+    real host's name and candidate set to the month — the person who ran the
+    session and the person who sat it both became unsearchable.
+    """
+
+    IS_SEGMENTS = "2026/09/Rohan_Mehta/Gartner/2026-09-15/Round-1/96355112813/MP4/a.mp4"
+
+    def parse(self, key):
+        record = s3_service._parse_key(key, 1234)
+        self.assertIsNotNone(record, f"key was dropped by the parser: {key}")
+        return record
+
+    def test_a_person_folder_is_a_host_of_the_parent_department(self):
+        record = self.parse("Interview-Success/Agrima_Agarwal/" + self.IS_SEGMENTS)
+        self.assertEqual(record["department"], "Interview-Success")
+        self.assertEqual(record["host"], "Agrima_Agarwal")
+        self.assertEqual(record["year"], "2026")
+        self.assertEqual(record["candidate"], "Rohan_Mehta")
+
+    def test_a_category_folder_becomes_its_own_department(self):
+        record = self.parse(
+            "Interview-Success/Internal-Interview/Agrima_Agarwal/" + self.IS_SEGMENTS)
+        self.assertEqual(record["department"], "Interview-Success/Internal-Interview")
+        # The fields that used to be shifted by one — this is the actual bug.
+        self.assertEqual(record["host"], "Agrima_Agarwal")
+        self.assertEqual(record["year"], "2026")
+        self.assertEqual(record["month"], "09")
+        self.assertEqual(record["candidate"], "Rohan_Mehta")
+
+    def test_a_category_folder_nobody_configured_is_still_recognised(self):
+        """Structural, not a name list: a category folder added to the bucket
+        later is classified without a config change or a redeploy."""
+        record = self.parse(
+            "Interview-Success/Some-New-Category/Nitin_Singh/" + self.IS_SEGMENTS)
+        self.assertEqual(record["department"], "Interview-Success/Some-New-Category")
+        self.assertEqual(record["host"], "Nitin_Singh")
+
+    def test_it_needs_no_entry_in_DEPARTMENTS_to_work(self):
+        """The property that decides whether this fix reaches production at all.
+
+        DEPARTMENTS is set explicitly in the deployed .env, so anything that had
+        to be listed there would need a server-side edit to take effect — and
+        would silently do nothing until someone made it. Interview-Success is
+        configured as a plain entry with no "/*", and the split still happens."""
+        self.assertIn("Interview-Success", s3_service.DEPARTMENTS)
+        self.assertNotIn("Interview-Success", s3_service.AUTO_PARENTS)
+        self.assertEqual(
+            s3_service._department_of(
+                ["Interview-Success", "Internal-Interview", "Nitin_Singh", "2026", "09"]),
+            ("Interview-Success/Internal-Interview", 2))
+
+    def test_stacked_category_folders_do_not_mis_file_the_host(self):
+        record = self.parse(
+            "Interview-Success/Training/Advanced/Nitin_Singh/" + self.IS_SEGMENTS)
+        self.assertEqual(record["department"], "Interview-Success/Training/Advanced")
+        self.assertEqual(record["host"], "Nitin_Singh")
+        self.assertEqual(record["year"], "2026")
+
+    def test_the_two_kinds_of_child_are_told_apart_by_what_is_inside_them(self):
+        """A host folder holds {Year}; a sub-department holds another host."""
+        self.assertTrue(s3_service._looks_like_host(
+            ["Interview-Success", "Agrima_Agarwal", "2026", "09"], 1))
+        self.assertFalse(s3_service._looks_like_host(
+            ["Interview-Success", "Internal-Interview", "Agrima_Agarwal", "2026"], 1))
+        # A year-shaped folder is only a year in the plausible range.
+        self.assertFalse(s3_service._looks_like_host(
+            ["Interview-Success", "Somebody", "1899", "09"], 1))
+        # Nothing below it at all -> cannot be a host.
+        self.assertFalse(s3_service._looks_like_host(["Interview-Success", "X"], 1))
+
+    def test_training_children_are_unaffected(self):
+        """Training/* has no host folders directly under it, so the mixed rule
+        must not disturb it."""
+        record = self.parse(
+            "Training/Resume-Based/Vivek_Parmar/2026/April/Khushali_Prasad"
+            "/2026-04-01/Time-11-00-AM-IST/8898177914/M4A/a.m4a")
+        self.assertEqual(record["department"], "Training/Resume-Based")
+        self.assertEqual(record["host"], "Vivek_Parmar")
+
+    def test_a_flat_department_is_unaffected(self):
+        record = self.parse(
+            "HR/Priya_Nair/2026/09/Rohan_Mehta/2026-09-15/Time-10-00-IST/963/MP4/a.mp4")
+        self.assertEqual(record["department"], "HR")
+        self.assertEqual(record["host"], "Priya_Nair")
+
+    def test_a_key_outside_every_department_is_still_dropped(self):
+        self.assertIsNone(s3_service._parse_key(
+            "Random-Folder/Someone/2026/09/c/2026-09-15/T/1/MP4/a.mp4", 1))
+
+    def test_the_parent_is_still_listed_once_for_scanning(self):
+        """Listing "Interview-Success" and "Interview-Success/*" together must not
+        make the indexer walk those objects twice."""
+        prefixes = s3_service._scan_prefixes()
+        self.assertEqual(prefixes.count("Interview-Success"), 1)
+        for name in prefixes:
+            self.assertFalse(name.startswith("Interview-Success/"),
+                             f"{name!r} is inside a prefix already being scanned")
+
+
 if __name__ == "__main__":
     unittest.main()

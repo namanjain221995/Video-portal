@@ -248,6 +248,14 @@ print(boto3.client('s3',region_name=os.environ['AWS_REGION'])\
 - Departments are the top-level bucket folders listed in `DEPARTMENTS` (`.env`).
   The portal scans them all and an admin grants each user a subset on the Admin
   page. Access is enforced server-side on every search/download/view request.
+- A department may hold **category sub-folders next to its host folders** —
+  `Interview-Success/Internal-Interview/` and `Interview-Success/Interview/` sit
+  beside two dozen person folders. The indexer tells them apart structurally (a
+  host folder always has a `{Year}` directly inside it; a category folder holds
+  more host folders), so each category becomes its own grantable department with
+  no `.env` entry. A user who already had the parent keeps the children, so a
+  newly split folder never takes access away; nobody else gains them until an
+  admin ticks the box.
 - **View-only** users get an in-browser preview (`/api/view`, inline presigned
   URL) and the download/zip buttons are removed. Note this is a soft control:
   inline streaming can never be made fully un-saveable by a determined user — it

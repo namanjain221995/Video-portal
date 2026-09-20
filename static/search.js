@@ -294,7 +294,10 @@
     // A calendar selection travels as an explicit from/to range; anything else the
     // user typed ("2026-06" for a whole month) stays a free-text date filter.
     const picked = datePicker.get();
-    const hasRange = !!(picked.from || picked.to);
+    const pickedDays = picked.dates || [];
+    // Three shapes, and only one of them travels: a set of separate days, an
+    // explicit from/to range, or whatever else was typed as free text.
+    const hasRange = !!(picked.from || picked.to || pickedDays.length);
     const types = fileTypes.get();
 
     const params = new URLSearchParams({
@@ -304,6 +307,7 @@
       date: hasRange ? "" : picked.raw,
       date_from: picked.from,
       date_to: picked.to,
+      dates: pickedDays.join(","),
       meeting_id: $("f-meeting").value,
       file_type: types.join(","),
       department: deptVal,

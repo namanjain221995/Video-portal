@@ -9,6 +9,7 @@ mis-read time is invisible in the UI — it just shows the wrong hour.
 
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("DEMO_MODE", "true")
 
@@ -120,6 +121,74 @@ class DateRangeSearchTests(unittest.TestCase):
     def test_a_range_alone_counts_as_a_real_query(self):
         _, total, _ = s3_service.search(date_from="2026-06-01", date_to="2026-06-30")
         self.assertGreater(total, 0)
+
+
+class ExactDateSetSearchTests(unittest.TestCase):
+    """`dates` — separate days that no single range can express.
+
+    "The 5th, the 12th and the 20th" is not a span: asking for it as a range
+    drags in the fortnight between, which is exactly what made the date filter
+    feel like it could only answer one question at a time.
+    """
+
+    PICKED = ["2026-04-01", "2026-06-15", "2026-06-20"]
+
+    def dates(self, **kwargs):
+        rows, _, _ = s3_service.search(limit=1000, **kwargs)
+        return sorted({r["date"] for r in rows})
+
+    def test_only_the_days_asked_for_come_back(self):
+        self.assertEqual(self.dates(dates=",".join(self.PICKED)), self.PICKED)
+
+    def test_the_days_between_are_not_dragged_in(self):
+        """The property that distinguishes this from a range."""
+        picked = self.dates(dates="2026-04-01,2026-06-20")
+        spanned = self.dates(date_from="2026-04-01", date_to="2026-06-20")
+        self.assertEqual(picked, ["2026-04-01", "2026-06-20"])
+        self.assertGreater(len(spanned), len(picked))
+
+    def test_a_list_and_a_string_mean_the_same_thing(self):
+        self.assertEqual(self.dates(dates=self.PICKED),
+                         self.dates(dates=" ".join(self.PICKED)))
+
+    def test_one_day_is_a_perfectly_good_set(self):
+        self.assertEqual(self.dates(dates="2026-06-15"), ["2026-06-15"])
+
+    def test_partial_and_junk_values_are_dropped_not_matched(self):
+        """A partial value belongs in the free-text filter; treating it as an
+        exact day would match nothing and look like an empty bucket."""
+        self.assertEqual(s3_service._clean_iso_dates("2026-06"), set())
+        self.assertEqual(s3_service._clean_iso_dates("not-a-date, 2026-06-15"),
+                         {"2026-06-15"})
+        self.assertEqual(s3_service._clean_iso_dates(None), set())
+        self.assertEqual(self.dates(dates="junk, 2026-06-15"), ["2026-06-15"])
+
+    def test_a_selection_of_only_junk_is_no_filter_rather_than_no_results(self):
+        self.assertEqual(s3_service.search(dates="nonsense", limit=1000), ([], 0, 0))
+
+    def test_a_day_set_alone_counts_as_a_real_query(self):
+        _, total, _ = s3_service.search(dates="2026-06-15")
+        self.assertGreater(total, 0)
+
+    def test_it_narrows_rather_than_replaces_the_other_date_filters(self):
+        rows, _, _ = s3_service.search(dates=",".join(self.PICKED), date="2026-06",
+                                       limit=1000)
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertIn(row["date"], {"2026-06-15", "2026-06-20"})
+
+    def test_it_never_widens_past_the_access_mask(self):
+        """A day set must not reach a department the caller was not granted."""
+        rows, _, _ = s3_service.search(dates=",".join(self.PICKED),
+                                       allowed_departments=["QMS"], limit=1000)
+        for row in rows:
+            self.assertEqual(row["department"], "QMS")
+
+    def test_an_undated_recording_is_never_one_of_the_chosen_days(self):
+        undated = [dict(r, date="") for r in s3_service.DEMO_RECORDS[:3]]
+        with mock.patch.object(s3_service, "get_records", return_value=undated):
+            self.assertEqual(s3_service.search(dates="2026-06-15", limit=1000),
+                             ([], 0, 0))
 
 
 class FileTypeMultiSelectTests(unittest.TestCase):

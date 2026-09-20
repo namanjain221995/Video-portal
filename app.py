@@ -96,7 +96,7 @@ def _current_access():
     known = s3_service.all_departments()   # configured + auto-discovered
     if session.get("role") == "admin":
         return {"departments": list(known), "hosts": {}, "meetings": {}, "can_download": True}
-    info = auth.user_access(session.get("user", ""))
+    info = auth.user_access(session.get("user", ""), known)
     # Intersect with the departments that actually exist, so a stale grant can't
     # widen access if a department is renamed/removed in config.
     depts = [d for d in info["departments"] if d in known]
@@ -501,6 +501,10 @@ def api_search():
             # that is not a full ISO date is ignored by s3_service.search.
             "date_from": request.args.get("date_from", ""),
             "date_to": request.args.get("date_to", ""),
+            # A comma-separated set of exact YYYY-MM-DD days, for a selection of
+            # separate dates that no single range can express. Non-ISO values are
+            # dropped by s3_service.search.
+            "dates": request.args.get("dates", ""),
             "meeting_id": request.args.get("meeting_id", ""),
             # Comma-separated category keys — the file-type filter is multi-select.
             "file_type": request.args.get("file_type", ""),
@@ -531,7 +535,7 @@ def api_search():
                 meeting_id=filters["meeting_id"],
                 # One readable "what date did they ask for?" column, whether that
                 # was typed free-text or picked as a range.
-                recording_date=filters["date"] or _date_range_label(
+                recording_date=filters["date"] or filters["dates"] or _date_range_label(
                     filters["date_from"], filters["date_to"]),
                 department=filters["department"],
                 file_type=filters["file_type"],
@@ -800,7 +804,7 @@ def api_users_list():
     # hosts_by_department drives the admin host pickers (non-blocking: empty
     # lists while the index is still warming, filled on the next load).
     opts = s3_service.filter_options()
-    users = auth.list_users()
+    users = auth.list_users(s3_service.all_departments())
     # Annotate each shared meeting with what it actually is, so the admin sees
     # "96355112813 · Akhilendra · Interview-Success" instead of a bare number
     # they have no way to check. One index pass covers every user at once.
@@ -936,7 +940,7 @@ def api_users_update(username):
         # Validate against the departments being set now, or the user's current
         # grant when only the hosts are changing.
         target = departments if departments is not None \
-            else auth.user_access(username)["departments"]
+            else auth.user_access(username, s3_service.all_departments())["departments"]
         hosts = _clean_hosts(data.get("hosts"), target)
     can_download = bool(data["can_download"]) if "can_download" in data else None
     try:

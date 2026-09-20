@@ -552,6 +552,21 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 }
 .dp-preset:hover { background: var(--brand-soft); color: var(--brand-dk); }
 .dp-main { padding: 12px; }
+/* Range / Pick days — a segmented control, so which of the two the next click
+   means is visible rather than something you have to remember. */
+.dp-modes {
+  display: flex; gap: 2px; margin-bottom: 10px;
+  background: #f1f5f9; border-radius: 9px; padding: 2px;
+}
+.dp-mode {
+  flex: 1; border: 0; background: none; cursor: pointer; font-family: inherit;
+  font-size: 12.5px; font-weight: 600; color: var(--ink-soft);
+  padding: 6px 10px; border-radius: 7px;
+}
+.dp-mode:hover { color: var(--brand-dk); }
+.dp-mode.is-on {
+  background: #fff; color: var(--brand-dk); box-shadow: 0 1px 2px rgba(2, 6, 23, .10);
+}
 .dp-head { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
 .dp-nav {
   width: 30px; height: 30px; flex-shrink: 0; border: 1px solid var(--line-2);
@@ -582,6 +597,13 @@ table.simple tbody tr:last-child td { border-bottom: none; }
 }
 .dp-day.is-start:not(.is-end) { border-radius: 8px 0 0 8px; }
 .dp-day.is-end:not(.is-start) { border-radius: 0 8px 8px 0; }
+/* Pick-days mode. Fully rounded on every side, deliberately: each day stands on
+   its own and nothing joins it to its neighbour, which is the whole visual
+   difference from a range. */
+.dp-day.is-picked {
+  background: var(--brand); color: #fff; font-weight: 700; border-radius: 8px;
+}
+.dp-day.is-picked:hover { background: var(--brand-dk); }
 .dp-foot {
   display: flex; align-items: center; gap: 8px;
   margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line);

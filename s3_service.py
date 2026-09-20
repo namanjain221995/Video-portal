@@ -263,6 +263,35 @@ _DEPT_SET = set(DEPARTMENTS)
 _DEPT_MAX_DEPTH = max((len(d.split("/")) for d in DEPARTMENTS), default=1)
 
 
+# A {Year} folder — the segment that always sits directly under a HOST in every
+# department layout. It is what tells a host folder apart from a sub-department
+# folder when both are children of the same parent (see _looks_like_host).
+_YEAR_RE = re.compile(r"^(?:19|20)\d{2}$")
+
+# How many CATEGORY folders may be stacked between a department and its hosts.
+# The bucket uses one (Interview-Success/Internal-Interview/{Host}/…); the extra
+# room costs nothing and keeps a deeper nest from being mis-filed rather than
+# merely unsupported.
+_MAX_CATEGORY_DEPTH = 3
+
+
+def _looks_like_host(parts, depth):
+    """Is ``parts[depth]`` a HOST folder rather than a sub-department folder?
+
+    Both sit in the same slot under a "Parent/*" department, which is the whole
+    difficulty: Interview-Success holds host folders (Agrima_Agarwal/) and
+    category folders (Internal-Interview/, Interview/) side by side. They are
+    told apart by what is INSIDE them, because every layout puts {Year} directly
+    under the host:
+
+        Interview-Success/Agrima_Agarwal/2026/09/…      <- 2026 -> a HOST
+        Interview-Success/Internal-Interview/Agrima/…   <- not  -> a SUB-DEPT
+
+    Structural, not a name list, so a host or a category folder added to the
+    bucket later is classified correctly with no config change and no redeploy."""
+    return len(parts) > depth + 1 and bool(_YEAR_RE.match(parts[depth + 1]))
+
+
 def _department_of(parts):
     """(department, segments_consumed) for a key already split on "/".
 
@@ -272,18 +301,42 @@ def _department_of(parts):
     sits under a "Parent/*" auto-discovery root, the department is the parent PLUS
     its next segment, which is how a sub-department created in S3 later gets
     indexed without appearing in any config. Returns (None, 0) for a key outside
-    every department, so an unrelated top-level folder can never enter the index."""
+    every department, so an unrelated top-level folder can never enter the index.
+
+    A department may then be MIXED — holding CATEGORY folders alongside its host
+    folders. Interview-Success is: Internal-Interview/ and Interview/ are
+    categories granted separately, while the two dozen person folders beside them
+    are hosts. Those are told apart structurally rather than from a configured
+    list (see _looks_like_host), because a list would have to be edited in .env
+    on the server every time a category folder is added — and one nobody
+    remembered to add is not a harmless omission, it is a pile of recordings
+    filed under a department named after a person, with the real host and the
+    candidate shifted out of their fields entirely."""
+    base = None
     for depth in range(min(_DEPT_MAX_DEPTH, len(parts)), 0, -1):
         candidate = "/".join(parts[:depth])
         if candidate in _DEPT_SET:
-            return candidate, depth
-    for parent in AUTO_PARENTS:
-        depth = len(parent.split("/"))
-        # Need a child segment AND something below it, else this is a stray file
-        # sitting directly in the parent folder rather than in a sub-department.
-        if len(parts) > depth + 1 and "/".join(parts[:depth]) == parent:
-            return "/".join(parts[:depth + 1]), depth + 1
-    return None, 0
+            base = (candidate, depth)
+            break
+    if base is None:
+        for parent in AUTO_PARENTS:
+            depth = len(parent.split("/"))
+            # Need a child segment AND something below it, else this is a stray
+            # file sitting directly in the parent rather than in a sub-department.
+            if len(parts) > depth + 1 and "/".join(parts[:depth]) == parent:
+                base = ("/".join(parts[:depth + 1]), depth + 1)
+                break
+    if base is None:
+        return None, 0
+    # Then walk down through any category folders stacked under it. Bounded, so a
+    # pathological key can only ever cost a few iterations.
+    name, depth = base
+    for _ in range(_MAX_CATEGORY_DEPTH):
+        if len(parts) <= depth + 1 or _looks_like_host(parts, depth):
+            break
+        depth += 1
+        name = "/".join(parts[:depth])
+    return name, depth
 
 
 def _scan_prefixes():
@@ -1002,8 +1055,25 @@ def _clean_iso_date(value):
     return value if _DATE_RE.match(value) else ""
 
 
+def _clean_iso_dates(value):
+    """The set of exact YYYY-MM-DD days in a multi-date selection.
+
+    Accepts a comma/space separated string or a list, and keeps only full ISO
+    dates — a partial value is not one of "these specific days" and belongs in
+    the free-text `date` filter. Returns an empty set for anything else, which
+    the caller reads as "no multi-date filter" rather than "match nothing"."""
+    if isinstance(value, str):
+        raw = re.split(r"[,\s;]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        raw = [piece for item in value if isinstance(item, str)
+               for piece in re.split(r"[,\s;]+", item.strip())]
+    else:
+        raw = []
+    return {v for v in (s.strip() for s in raw) if _DATE_RE.match(v)}
+
+
 def search(candidate="", company="", date="", meeting_id="", file_type="", host="",
-           department="", date_from="", date_to="", allowed_departments=None,
+           department="", date_from="", date_to="", dates=None, allowed_departments=None,
            allowed_hosts=None, allowed_meetings=None, limit=None, offset=0, sort=""):
     """Filter the index. Returns (rows, total, total_size) where rows is the
     `offset:offset+limit` page (limit defaults to RESULT_LIMIT) of the sorted
@@ -1021,9 +1091,11 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
 
     `file_type` accepts SEVERAL categories at once ("video,audio" or a list), and
     `date_from`/`date_to` are an inclusive YYYY-MM-DD range — either bound alone is
-    open-ended, and both set to the same day is a single-day filter. The range
-    combines with the free-text `date` (which still matches a partial value such as
-    a whole month) rather than replacing it.
+    open-ended, and both set to the same day is a single-day filter. `dates` is a
+    SET of exact YYYY-MM-DD days instead ("the 5th, the 12th and the 20th"), which
+    a range cannot express without dragging in everything between them. All three
+    combine with the free-text `date` (which still matches a partial value such as
+    a whole month) rather than replacing it, so they narrow and never widen.
 
     Empty query short-circuits to ([], 0, 0) WITHOUT touching S3 — so landing the
     page (or a blank submit) never scans or serialises the whole bucket. The access
@@ -1037,6 +1109,9 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     categories = set(_category_filter(file_type))    # category keys (video/audio/…)
     date_from  = _clean_iso_date(date_from)
     date_to    = _clean_iso_date(date_to)
+    # Specific, non-touching days ("the 5th, the 12th and the 20th"), which a
+    # from/to range cannot express without dragging in everything between them.
+    date_set   = _clean_iso_dates(dates)
     if date_from and date_to and date_from > date_to:
         date_from, date_to = date_to, date_from      # a reversed range is still a range
     # Tokenise up front: separator-only input ('-', '_') yields no tokens and must
@@ -1044,7 +1119,7 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
     # caller's whole allowed corpus.
     cand_toks = _cand_tokens(candidate)
 
-    if not any([cand_toks, company, date, date_from, date_to, meeting_id,
+    if not any([cand_toks, company, date, date_from, date_to, date_set, meeting_id,
                 categories, host, department]):
         return [], 0, 0
 
@@ -1062,6 +1137,10 @@ def search(candidate="", company="", date="", meeting_id="", file_type="", host=
         if company and company not in r["company"].lower():     # substring, free-text
             continue
         if date and date not in r["date"].lower():              # "2026-06" matches a month
+            continue
+        # A set of exact days, so an undated recording can never be one of the
+        # days that were actually asked for.
+        if date_set and r["date"] not in date_set:
             continue
         if date_from or date_to:
             # ISO dates compare correctly as strings. An undated recording cannot

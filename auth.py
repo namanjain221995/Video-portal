@@ -40,19 +40,58 @@ SPLIT_DEPARTMENTS = {
 }
 
 
-def _expand_split(departments, hosts):
-    """Rewrite a stored grant so any split parent is replaced by its children."""
-    if not any(d in SPLIT_DEPARTMENTS for d in departments):
-        return list(departments), dict(hosts)
+def _expansion(dept, known):
+    """Every department a stored grant for ``dept`` actually covers.
+
+    Two shapes of split, told apart by whether the parent is still a department:
+
+    * FULLY split (Training) — the parent folder stopped being a department when
+      its children became ones, so the grant becomes the children alone.
+    * MIXED (Interview-Success) — host folders still sit directly under the
+      parent, with category folders like Internal-Interview/ beside them, so the
+      grant keeps the parent AND gains its children.
+
+    The static map above is a FLOOR, not the whole answer: it is unioned with the
+    children actually present in ``known``. That matters in both directions — the
+    map has gone stale (Training/Coding and Training/Retraining exist in the
+    bucket but were never added to it, so a legacy "Training" grant silently
+    missed them), and ``known`` is empty while the index is still warming, when
+    the map is the only thing keeping a legacy grant alive."""
+    children = list(SPLIT_DEPARTMENTS.get(dept, []))
+    prefix = dept + "/"
+    for child in (known or ()):
+        if child.startswith(prefix) and child not in children:
+            children.append(child)
+    if not children:
+        return [dept]
+    if dept in SPLIT_DEPARTMENTS:
+        return children                      # the parent is gone; children cover it
+    return [dept] + children                 # the parent still holds its own hosts
+
+
+def _expand_split(departments, hosts, known=None):
+    """Rewrite a stored grant so a split parent also names its sub-departments.
+
+    ``known`` is every department the bucket currently has (from
+    s3_service.all_departments()). Passing it lets a grant follow sub-departments
+    that were discovered rather than configured; omitting it falls back to the
+    static map alone, so a caller that has no live vocabulary still behaves as
+    this always did."""
+    expansions = {d: _expansion(d, known) for d in departments}
+    if all(v == [d] for d, v in expansions.items()):
+        return list(departments), dict(hosts)          # nothing to rewrite
     out, seen = [], set()
     for dept in departments:
-        for name in SPLIT_DEPARTMENTS.get(dept, [dept]):
+        for name in expansions[dept]:
             if name not in seen:
                 seen.add(name)
                 out.append(name)
     new_hosts = {}
     for dept, host_list in (hosts or {}).items():
-        for name in SPLIT_DEPARTMENTS.get(dept, [dept]):
+        # A host restriction must follow the grant into the children, or it would
+        # key off a department the grant no longer names and so restrict nothing —
+        # WIDENING access instead of preserving it.
+        for name in expansions.get(dept, [dept]):
             if name in seen and host_list:
                 # A child may also carry its own entry; keep the union.
                 merged = list(dict.fromkeys(list(new_hosts.get(name, [])) + list(host_list)))
@@ -118,17 +157,22 @@ def _stored_meetings(rec: dict) -> list:
     return out
 
 
-def list_users() -> list:
+def list_users(known_departments=None) -> list:
     """Accounts as the Admin page should show them — i.e. the EFFECTIVE grant, with
     split parents already expanded, so the ticked boxes match what user_access()
     actually enforces. Saving a row then rewrites the stored grant in the new
-    vocabulary, which is how a legacy record migrates itself."""
+    vocabulary, which is how a legacy record migrates itself.
+
+    Pass ``known_departments`` (s3_service.all_departments()) so sub-departments
+    discovered in the bucket are expanded too, not just the ones hard-coded in
+    SPLIT_DEPARTMENTS."""
     users = _load_users()
     out = []
     for username, rec in users.items():
         depts, hosts = _expand_split(
             rec.get("departments", list(LEGACY_DEFAULT_DEPTS)),
             rec.get("hosts") or {},
+            known_departments,
         )
         out.append({"username": username,
                     "created_at": rec.get("created_at"),
@@ -140,18 +184,22 @@ def list_users() -> list:
     return sorted(out, key=lambda x: x["username"].lower())
 
 
-def user_access(username: str) -> dict:
+def user_access(username: str, known_departments=None) -> dict:
     """The access a normal user was granted: which departments they may browse,
     an optional per-department host restriction ({dept: [host, …]} — a missing or
     empty entry means EVERY host in that department), individually shared meetings
     ({meeting_id: can_download}), and whether they may download inside their
     departments (vs view-only). Missing fields fall back to the legacy defaults so
-    pre-existing accounts keep working unchanged."""
+    pre-existing accounts keep working unchanged.
+
+    Pass ``known_departments`` (s3_service.all_departments()) so a grant for a
+    parent follows into sub-departments discovered in the bucket rather than only
+    the ones listed in SPLIT_DEPARTMENTS."""
     rec = _load_users().get((username or "").strip()) or {}
     depts = rec.get("departments")
     if depts is None:
         depts = list(LEGACY_DEFAULT_DEPTS)
-    depts, hosts = _expand_split(depts, rec.get("hosts") or {})
+    depts, hosts = _expand_split(depts, rec.get("hosts") or {}, known_departments)
     return {"departments": depts,
             "hosts": hosts,
             "meetings": {m["meeting_id"]: m["can_download"] for m in _stored_meetings(rec)},
