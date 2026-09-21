@@ -52,7 +52,6 @@ import sys
 import json
 import time
 import zipfile
-import tempfile
 import threading
 import mimetypes
 from concurrent.futures import ThreadPoolExecutor
@@ -1412,35 +1411,98 @@ def _flat_name(rec: dict) -> str:
     return base.replace("/", "_")
 
 
-def build_zip(keys):
-    """Stream the given S3 objects into a temp zip on disk and return its path.
-    ZIP_STORED (no compression) because media is already compressed — fast and
-    memory-light. Caller is responsible for deleting the returned path."""
-    rec_by_key = _records_by_key()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+class _ZipSink(io.RawIOBase):
+    """A write-only, UNSEEKABLE target for zipfile that the caller drains.
+
+    Unseekable is the point. Handed a stream it cannot seek, zipfile writes each
+    entry's CRC and sizes in a data descriptor AFTER the entry instead of going
+    back to patch its header — which is exactly what lets the archive leave the
+    server as it is produced, with no temp file and no second pass."""
+
+    def __init__(self):
+        super().__init__()
+        self._chunks = []
+
+    def writable(self):
+        return True
+
+    def write(self, data):
+        self._chunks.append(bytes(data))
+        return len(data)
+
+    def drain(self) -> bytes:
+        out = b"".join(self._chunks)
+        self._chunks.clear()
+        return out
+
+
+# Bytes pulled from S3 per read while streaming a zip. Big enough to keep the
+# per-request overhead negligible, small enough that a worker holds ~1 MiB, not
+# the archive.
+ZIP_STREAM_CHUNK = 1024 * 1024
+
+
+def _zip_timestamp(rec):
+    """The recording's own date/time for its entry in the zip, so files extract
+    with a meaningful modified date instead of all reading 1980-01-01."""
     try:
-        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
-            for key in keys:
-                rec = rec_by_key.get(key)
-                if rec is None:
-                    continue
-                arcname = _flat_name(rec)
+        year, month, day = (int(p) for p in (rec.get("date") or "").split("-"))
+        hour, minute = (int(p) for p in (rec.get("time") or "00:00").split(":"))
+        if year >= 1980:
+            return (year, month, day, hour, minute, 0)
+    except (TypeError, ValueError):
+        pass
+    return (1980, 1, 1, 0, 0, 0)
+
+
+def stream_zip(records):
+    """Yield a ZIP of the given index records, chunk by chunk, as S3 serves them.
+
+    This replaced building the whole archive in a temp file and only then
+    sending it, which broke on exactly the downloads people most want zipped. A
+    6.6 GB selection meant minutes of copying S3 to local disk with not one byte
+    going to the browser, so the HTTPS proxy in front of the app gave up on the
+    idle connection and the user saw a bare "Could not build the zip." — and the
+    temp file wanted 6.6 GB of free disk on the box besides. Streaming sends the
+    first bytes immediately, keeps the connection busy for its whole life, and
+    holds one chunk in memory at a time whatever the archive's size.
+
+    ZIP_STORED (no compression) because recordings are already compressed:
+    deflating them costs CPU and saves nothing.
+
+    Callers must authorize every record BEFORE calling this — once the first
+    chunk is sent the status line is gone, and a failure can only cut the
+    download short (the browser then reports it as failed; it is never handed a
+    silently incomplete archive, because the central directory is written last)."""
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:
+        for rec in records:
+            info = zipfile.ZipInfo(_flat_name(rec), date_time=_zip_timestamp(rec))
+            info.compress_type = zipfile.ZIP_STORED
+            size = int(rec.get("size") or 0)
+            # The indexed size lets zipfile commit to ZIP64 in the entry header up
+            # front for a >2 GB recording, which it cannot change once streaming.
+            # With no size on record, force it rather than fail at the end.
+            info.file_size = size
+            with zf.open(info, "w", force_zip64=size <= 0) as dest:
                 if DEMO_MODE:
-                    zf.writestr(arcname, _demo_bytes(rec))
-                    continue
-                obj = _client().get_object(Bucket=BUCKET, Key=key)
-                with zf.open(arcname, "w") as dest:
-                    for chunk in obj["Body"].iter_chunks(1024 * 256):
-                        dest.write(chunk)
-        tmp.close()
-        return tmp.name
-    except Exception:
-        tmp.close()
-        try:
-            os.unlink(tmp.name)
-        except OSError:
-            pass
-        raise
+                    dest.write(_demo_bytes(rec))
+                else:
+                    body = _client().get_object(Bucket=BUCKET, Key=rec["key"])["Body"]
+                    try:
+                        for chunk in body.iter_chunks(ZIP_STREAM_CHUNK):
+                            dest.write(chunk)
+                            data = sink.drain()
+                            if data:
+                                yield data
+                    finally:
+                        body.close()
+            data = sink.drain()          # the entry's data descriptor
+            if data:
+                yield data
+    data = sink.drain()                  # the central directory, written on close
+    if data:
+        yield data
 
 
 # ─────────────────────────────────────────────────────────────────────────────

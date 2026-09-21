@@ -397,35 +397,27 @@ class AuditLogIntegrationTests(unittest.TestCase):
         self.assertIn("at most", response.get_json()["error"])
 
     def test_bulk_zip_deduplicates_keys_and_records_item_metadata(self):
-        zip_paths = []
-        real_build_zip = s3_service.build_zip
+        streamed = []
+        real_stream_zip = s3_service.stream_zip
 
-        def capture_zip(keys):
-            path = real_build_zip(keys)
-            zip_paths.append(path)
-            return path
+        def capture_stream(records):
+            streamed.append([r["key"] for r in records])
+            return real_stream_zip(records)
 
-        try:
-            with portal.app.test_client() as client:
-                self._login_admin(client)
-                result = client.get("/api/search", query_string={
-                    "meeting_id": "96355112813",
-                }).get_json()["results"][0]
-                with mock.patch.object(s3_service, "build_zip", side_effect=capture_zip):
-                    response = client.post("/api/download/bulk", json={
-                        "keys": [result["key"], result["key"], "not/authorized"],
-                    })
-                    self.assertEqual(response.status_code, 200)
-                    self.assertTrue(response.get_data().startswith(b"PK"))
-                    response.close()
-            self.assertTrue(zip_paths)
-            self.assertTrue(all(not os.path.exists(path) for path in zip_paths))
-        finally:
-            for path in zip_paths:
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
+        with portal.app.test_client() as client:
+            self._login_admin(client)
+            result = client.get("/api/search", query_string={
+                "meeting_id": "96355112813",
+            }).get_json()["results"][0]
+            with mock.patch.object(s3_service, "stream_zip", side_effect=capture_stream):
+                response = client.post("/api/download/bulk", json={
+                    "keys": [result["key"], result["key"], "not/authorized"],
+                })
+                self.assertEqual(response.status_code, 200)
+                self.assertTrue(response.get_data().startswith(b"PK"))
+                response.close()
+        # The repeat collapses and the unauthorized key never reaches the stream.
+        self.assertEqual(streamed, [[result["key"]]])
 
         event = next(
             item for item in audit_service.list_events(per_page=100)["events"]

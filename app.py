@@ -10,16 +10,18 @@ Run locally:
 import io
 import os
 import re
+import json
+import hashlib
 import functools
 
 from dotenv import load_dotenv
 load_dotenv()  # must run before importing modules that read os.environ at import time
 
-from werkzeug.wsgi import ClosingIterator
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 
 from flask import (
     Flask, render_template, request, jsonify, session,
-    redirect, url_for, send_file, abort,
+    redirect, url_for, send_file, abort, Response,
 )
 
 import auth
@@ -695,18 +697,28 @@ def api_captions():
     return jsonify({"tracks": tracks})
 
 
-@app.route("/api/download/bulk", methods=["POST"])
-@login_required
-def api_download_bulk():
-    access = _current_access()
-    if not _can_download_anything(access):
-        return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
-    data = request.get_json(silent=True)
-    if request.is_json and not isinstance(data, dict):
-        return jsonify({"error": "Request body must be a JSON object."}), 400
-    if data is None:
-        data = {}
-    submitted_keys = data.get("keys") or []
+# How long a preflight's go-ahead stays valid. It only has to cover the moment
+# between the page checking a selection and the browser starting the download.
+_BULK_TOKEN_MAX_AGE = 300
+
+
+def _bulk_serializer():
+    return URLSafeTimedSerializer(app.secret_key, salt="bulk-zip-download")
+
+
+def _bulk_keys_digest(submitted):
+    """A stable fingerprint of a submitted key list, order and repeats ignored."""
+    keys = sorted({k for k in (submitted or []) if isinstance(k, str)})
+    return hashlib.sha256("\n".join(keys).encode("utf-8")).hexdigest()
+
+
+def _bulk_selection(submitted_keys, access):
+    """Authorize a bulk selection: ``(records, None)`` when every selected file may
+    be zipped by this caller, else ``(None, (response, status))`` saying why.
+
+    Shared by the preflight and the download itself so the two can never
+    disagree — and so the download re-checks everything rather than trusting a
+    preflight that ran a moment earlier, when the grant may have been different."""
     records = []
     view_only = 0
     seen_keys = set()
@@ -727,29 +739,126 @@ def api_download_bulk():
             else:
                 view_only += 1
     if view_only:
-        return jsonify({
+        return None, (jsonify({
             "error": f"{view_only} of the selected file(s) are view-only for your "
                      "account and cannot be zipped. Deselect them and try again."
-        }), 403
-    keys = [rec["key"] for rec in records]
-    if not keys:
-        return jsonify({"error": "No files selected."}), 400
+        }), 403)
+    if not records:
+        return None, (jsonify({"error": "No files selected."}), 400)
     if len(records) > s3_service.BULK_ZIP_MAX_FILES:
-        return jsonify({
+        return None, (jsonify({
             "error": f"A ZIP can contain at most {s3_service.BULK_ZIP_MAX_FILES} files."
-        }), 413
+        }), 413)
     total_bytes = sum(int(rec.get("size") or 0) for rec in records)
     if total_bytes > s3_service.BULK_ZIP_MAX_BYTES:
         limit_gb = s3_service.BULK_ZIP_MAX_BYTES / (1024 ** 3)
-        return jsonify({
+        return None, (jsonify({
             "error": f"A ZIP can contain at most {limit_gb:g} GB of recordings."
-        }), 413
+        }), 413)
+    return records, None
 
+
+@app.route("/api/download/bulk/check", methods=["POST"])
+@login_required
+def api_download_bulk_check():
+    """Preflight for a bulk zip: validate the selection and hand back a
+    short-lived go-ahead token, WITHOUT building anything.
+
+    The page needs this because the zip itself is now received by the browser's
+    own download manager rather than by fetch() — which is what lets a
+    multi-gigabyte archive stream to disk instead of being held in a tab's
+    memory. The price is that a native download cannot show a friendly error, so
+    every refusal ("view-only", "too many files") is surfaced here first, as JSON
+    the page can display."""
+    access = _current_access()
+    if not _can_download_anything(access):
+        return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+    records, error = _bulk_selection(data.get("keys"), access)
+    if error:
+        return error
+    token = _bulk_serializer().dumps({
+        "u": session.get("user", ""),
+        "k": _bulk_keys_digest(data.get("keys")),
+    })
+    return jsonify({
+        "ok": True,
+        "files": len(records),
+        "total_size": sum(int(r.get("size") or 0) for r in records),
+        "token": token,
+    })
+
+
+def _valid_bulk_token(token, submitted_keys):
+    """Did this form post come from our own page, for this user and these keys?
+
+    A plain form post is what lets the browser receive the zip natively, but a
+    form is also exactly what another site can submit on a signed-in user's
+    behalf. The JSON path never had that exposure (a cross-site page cannot send
+    application/json without a CORS preflight), so the form path carries a
+    signed, expiring token from the preflight — bound to the user and the exact
+    selection — which another origin has no way to obtain."""
     try:
-        zip_path = s3_service.build_zip(keys)
+        payload = _bulk_serializer().loads(token or "", max_age=_BULK_TOKEN_MAX_AGE)
+    except BadSignature:                  # includes SignatureExpired
+        return False
+    return (isinstance(payload, dict)
+            and payload.get("u") == session.get("user", "")
+            and payload.get("k") == _bulk_keys_digest(submitted_keys))
+
+
+@app.route("/api/download/bulk", methods=["POST"])
+@login_required
+def api_download_bulk():
+    """Stream a ZIP of the selected recordings.
+
+    Accepts the selection as a JSON body (API callers) or as a form post carrying
+    a preflight token (the Search page — see api_download_bulk_check). Either
+    way the archive is STREAMED as it is assembled from S3: nothing is staged on
+    the server's disk, and bytes start flowing at once.
+
+    The old build-it-first approach copied the whole selection from S3 to a temp
+    file before sending a byte. For 99 files / 6.6 GB that left the connection
+    silent for minutes; Cloudflare, which fronts the portal, gave up on the idle
+    origin and answered 502 with its own HTML page — which the Search page could
+    only show as a bare "Could not build the zip."."""
+    access = _current_access()
+    if not _can_download_anything(access):
+        return jsonify({"error": "Your account is view-only — downloads are disabled."}), 403
+    if request.is_json:
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return jsonify({"error": "Request body must be a JSON object."}), 400
+        submitted_keys = data.get("keys") or []
+    else:
+        try:
+            submitted_keys = json.loads(request.form.get("keys") or "[]")
+        except ValueError:
+            submitted_keys = None
+        if not _valid_bulk_token(request.form.get("token"), submitted_keys):
+            return jsonify({
+                "error": "This download link has expired. Select the files and "
+                         "click Download again."
+            }), 403
+    records, error = _bulk_selection(submitted_keys, access)
+    if error:
+        return error
+
+    # Pull the first chunk before committing to a 200. Once streaming starts the
+    # status line has gone and a failure can only cut the download short, so the
+    # likeliest failures — expired AWS credentials, a recording deleted since the
+    # last index — are caught here while they can still be reported properly.
+    stream = s3_service.stream_zip(records)
+    try:
+        first_chunk = next(stream)
+    except StopIteration:
+        first_chunk = b""
     except Exception as e:
         return jsonify({"error": _s3_err(e)}), 502
 
+    total_bytes = sum(int(rec.get("size") or 0) for rec in records)
     meeting_ids = sorted({r.get("meeting_id", "") for r in records if r.get("meeting_id")})
     candidates = sorted({r.get("candidate", "") for r in records if r.get("candidate")})
     hosts = sorted({r.get("host", "") for r in records if r.get("host")})
@@ -776,23 +885,30 @@ def api_download_bulk():
         },
     )
 
-    response = send_file(
-        zip_path,
-        as_attachment=True,
-        download_name="interview-recordings.zip",
-        mimetype="application/zip",
-    )
+    user = session.get("user", "")
 
-    def _cleanup():
+    def body():
+        yield first_chunk
         try:
-            os.unlink(zip_path)
-        except OSError:
-            pass
+            yield from stream
+        except GeneratorExit:
+            raise                        # the browser went away — nothing to report
+        except Exception:
+            # Too late for a status code. Log it, and let the connection drop so
+            # the browser marks the download failed, rather than saving a zip with
+            # no central directory as though it were complete.
+            app.logger.exception("Bulk zip for %s failed part-way through", user)
+            raise
 
-    # Tie cleanup to the file iterable itself. This runs after the file handle is
-    # closed (including on Windows, where unlinking an open ZIP would fail).
-    response.response = ClosingIterator(response.response, [_cleanup])
-    return response
+    return Response(body(), mimetype="application/zip", headers={
+        "Content-Disposition": 'attachment; filename="interview-recordings.zip"',
+        "Cache-Control": "no-store",
+        "X-Content-Type-Options": "nosniff",
+        # Proxies buffer upstream responses by default, which for a stream defeats
+        # the purpose. deploy/nginx.conf already turns it off; this makes it hold
+        # for any nginx in front, whatever its config says.
+        "X-Accel-Buffering": "no",
+    })
 
 
 # ─────────────────────────────────────────────────────────────────────────────

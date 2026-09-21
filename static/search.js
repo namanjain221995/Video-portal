@@ -527,40 +527,88 @@
   }
 
   // ── bulk zip download ────────────────────────────────────────────────────
+  // Two steps, deliberately. The zip used to be fetched into a Blob, which holds
+  // the ENTIRE archive in this tab's memory before anything is saved — hopeless
+  // for a 6.6 GB selection. Now a preflight validates the selection (so every
+  // refusal can still be shown here as a proper message), and then a plain form
+  // post hands the streamed zip to the browser's own download manager, which
+  // writes it straight to disk and shows real progress.
   async function downloadZip() {
     if (selected.size === 0) return;
     const btn = $("btn-zip");
+    const keys = Array.from(selected.keys());
     btn.disabled = true;
-    btn.innerHTML = '<span class="spinner"></span> Building zip…';
+    btn.innerHTML = '<span class="spinner"></span> Preparing zip…';
     clearNotice();
     try {
-      const resp = await fetch("/api/download/bulk", {
+      const resp = await fetch("/api/download/bulk/check", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ keys: Array.from(selected.keys()) }),
+        body: JSON.stringify({ keys }),
       });
       if (resp.status === 401) { location.href = "/login"; return; }
-      if (!resp.ok) {
-        const data = await resp.json().catch(() => ({}));
-        showNotice(data.error || "Could not build the zip.", "error");
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data.token) {
+        // Name the status: a bare "could not build" is what hid the real cause
+        // last time — a proxy's HTML error page has no JSON message to show.
+        showNotice(data.error || `Could not prepare the zip (HTTP ${resp.status}).`, "error");
         return;
       }
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "interview-recordings.zip";
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-      showNotice(`Downloaded ${selected.size} file(s) as a zip.`, "ok");
+      startNativeDownload(keys, data.token);
+      showNotice(
+        `Your zip of ${data.files} file(s) (${fmtSize(data.total_size)}) is downloading — ` +
+        "follow its progress in your browser's downloads. Large selections take a few minutes.",
+        "ok");
     } catch (err) {
-      showNotice("Network error while downloading the zip.", "error");
+      showNotice("Network error while preparing the zip.", "error");
     } finally {
       btn.disabled = false;
       btn.textContent = "⬇ Download selected (.zip)";
     }
+  }
+
+  // The form posts into a hidden iframe, not this page. When the server answers
+  // with the zip, the browser turns it into a download and the iframe never loads
+  // — so a `load` event means it answered with a PAGE instead: an error that only
+  // arose after the preflight (the go-ahead expired, S3 refused the first file).
+  // Same-origin, so that page can be read and its message shown here.
+  function zipFrame() {
+    let frame = document.getElementById("zip-download-frame");
+    if (frame) return frame;
+    frame = document.createElement("iframe");
+    frame.id = "zip-download-frame";
+    frame.name = "zip-download-frame";
+    frame.hidden = true;
+    document.body.appendChild(frame);
+    frame.addEventListener("load", () => {
+      let doc = null;
+      try { doc = frame.contentDocument; } catch (e) { /* cross-origin: nothing to read */ }
+      if (!doc || !doc.body || doc.location.href === "about:blank") return;
+      const text = doc.body.textContent || "";
+      let message = "";
+      try { message = (JSON.parse(text) || {}).error || ""; } catch (e) { /* not JSON */ }
+      showNotice(message || "The zip could not be started. Please try again.", "error");
+    });
+    return frame;
+  }
+
+  function startNativeDownload(keys, token) {
+    const frame = zipFrame();
+    const form = document.createElement("form");
+    form.method = "POST";
+    form.action = "/api/download/bulk";
+    form.target = frame.name;
+    form.hidden = true;
+    [["keys", JSON.stringify(keys)], ["token", token]].forEach(([name, value]) => {
+      const field = document.createElement("input");
+      field.type = "hidden";
+      field.name = name;
+      field.value = value;
+      form.appendChild(field);
+    });
+    document.body.appendChild(form);
+    form.submit();
+    form.remove();
   }
 
   // ── refresh index ────────────────────────────────────────────────────────
